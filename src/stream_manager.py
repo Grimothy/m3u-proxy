@@ -479,6 +479,9 @@ class StreamManager:
             self.streams[effective_stream_id].client_count = len(
                 self.stream_clients[effective_stream_id])
             self.streams[effective_stream_id].connected_clients.add(client_id)
+            # Reset the STREAM_STOPPED guard so the event can fire again when this
+            # client (or the last of multiple clients) eventually disconnects.
+            self.streams[effective_stream_id].stream_stopped_emitted = False
 
         client_info = self.clients[client_id]
         client_info.last_access = now
@@ -693,6 +696,9 @@ class StreamManager:
             failover_count = 0
             max_failovers = 3
             max_vod_reconnects = 5
+            # Flag: upstream finished serving this range naturally (not a client disconnect/error)
+            # Used to skip immediate client removal for VOD, since clients may seek again
+            natural_vod_completion = False
 
             # Retry tracking variables for handling temporary connection issues
             retry_count = 0
@@ -1201,14 +1207,25 @@ class StreamManager:
                     if not stream_info.failover_event.is_set():
                         logger.info(
                             f"Stream completed for client {client_id}: {chunk_count} chunks, {bytes_served} bytes")
-                        if not stream_info.stream_stopped_emitted:
-                            stream_info.stream_stopped_emitted = True
-                            await self._emit_event("STREAM_STOPPED", stream_id, {
-                                "client_id": client_id,
-                                "bytes_served": bytes_served,
-                                "chunks_served": chunk_count,
-                                "metadata": stream_info.metadata
-                            })
+                        # For VOD, mark as naturally completed so we skip immediate client removal.
+                        # The client may issue more Range requests (seek probes, actual seeks, etc.)
+                        # and should remain registered until a real disconnect or periodic cleanup.
+                        # STREAM_STOPPED is NOT emitted here for VOD — cleanup_client already
+                        # emits it when the last client truly disconnects (lines 558–572), which
+                        # correctly handles seeking and resume-from-position scenarios.
+                        if stream_info.is_vod:
+                            natural_vod_completion = True
+                        else:
+                            # For live/continuous streams, natural completion means the upstream
+                            # ended — emit STREAM_STOPPED now.
+                            if not stream_info.stream_stopped_emitted:
+                                stream_info.stream_stopped_emitted = True
+                                await self._emit_event("STREAM_STOPPED", stream_id, {
+                                    "client_id": client_id,
+                                    "bytes_served": bytes_served,
+                                    "chunks_served": chunk_count,
+                                    "metadata": stream_info.metadata
+                                })
                         break  # Exit the failover loop
                     # else: failover event was set, continue to next iteration
 
@@ -1555,8 +1572,23 @@ class StreamManager:
 
                 self._stats.total_bytes_served += bytes_remaining
 
-            # Cleanup client - pass connection_id to prevent race conditions
-            await self.cleanup_client(client_id, connection_id)
+            # For VOD ranges that ended naturally (upstream finished serving bytes),
+            # keep the client registered so subsequent seek requests from the same
+            # client (Kodi file-size probe → actual seek → etc.) can reuse it without
+            # re-registration gaps.  The periodic cleanup will remove truly idle clients.
+            # For all other exits (client disconnect, error, cancel), do a full cleanup.
+            if natural_vod_completion:
+                if connection_id in self.connection_cancel_events:
+                    del self.connection_cancel_events[connection_id]
+                if client_id in self.clients and self.clients[client_id].active_connection_id == connection_id:
+                    self.clients[client_id].active_connection_id = None
+                logger.info(
+                    f"VOD range served naturally for client {client_id} (connection {connection_id}), "
+                    f"client kept registered for potential seek requests"
+                )
+            else:
+                # Cleanup client - pass connection_id to prevent race conditions
+                await self.cleanup_client(client_id, connection_id)
 
         # Determine content type
         # Add `or current_url.endswith('?profile=pass')` to handle TVHeadend passthrough URLs
