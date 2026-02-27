@@ -1650,12 +1650,12 @@ class StreamManager:
         # In strict mode for live TS, NEVER return 206 or Content-Length
         if strict_mode_enabled and stream_info.is_live_continuous:
             status_code = 200
-            # Do NOT include Content-Length or Content-Range for live streams in strict mode  
+            # Do NOT include Content-Length or Content-Range for live streams in strict mode
             headers.pop("Content-Length", None)
             headers.pop("Content-Range", None)
             logger.info(
                 "STRICT MODE: Returning 200 OK without Content-Length or Content-Range for live TS stream")
-        elif range_header and provider_status_code == 206:
+        elif range_header and provider_status_code == 206 and provider_content_range:
             # Provider returned 206, we should also return 206 (only for non-strict or VOD)
             status_code = 206
             logger.info(
