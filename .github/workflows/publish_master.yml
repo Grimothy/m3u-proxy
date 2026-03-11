@@ -4,7 +4,13 @@ on:
     types: [published]
 
 jobs:
+  ci:
+    name: Run CI
+    uses: ./.github/workflows/ci.yml
+    secrets: inherit
+
   release-amd64:
+    needs: [ci]
     name: Publish m3u-proxy Docker image (amd64)
     runs-on: ubuntu-latest
     steps:
@@ -47,6 +53,7 @@ jobs:
           sbom: false
 
   release-arm64:
+    needs: [ci]
     name: Publish m3u-proxy Docker image (arm64)
     runs-on: ubuntu-22.04-arm
     steps:
