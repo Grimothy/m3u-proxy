@@ -235,6 +235,13 @@ class StreamCreateRequest(BaseModel):
     strict_live_ts: Optional[bool] = None
     # Enable Sticky Session Handler for this stream
     use_sticky_session: Optional[bool] = None
+    # Silence detection overrides (None = use global ENV var defaults)
+    enable_silence_detection: Optional[bool] = None
+    silence_threshold_db: Optional[float] = None
+    silence_duration: Optional[float] = None
+    silence_check_interval: Optional[float] = None
+    silence_failover_threshold: Optional[int] = None
+    silence_monitoring_grace_period: Optional[float] = None
 
     @field_validator('url')
     @classmethod
@@ -284,6 +291,13 @@ class TranscodeCreateRequest(BaseModel):
     strict_live_ts: Optional[bool] = None
     # Enable Sticky Session Handler for this stream
     use_sticky_session: Optional[bool] = None
+    # Silence detection overrides (None = use global ENV var defaults)
+    enable_silence_detection: Optional[bool] = None
+    silence_threshold_db: Optional[float] = None
+    silence_duration: Optional[float] = None
+    silence_check_interval: Optional[float] = None
+    silence_failover_threshold: Optional[int] = None
+    silence_monitoring_grace_period: Optional[float] = None
     profile: Optional[str] = None  # Profile name or custom template
     profile_variables: Optional[Dict[str, str]] = None
     output_format: Optional[str] = None  # mp4, mkv, ts, etc.
@@ -700,7 +714,13 @@ async def create_stream(request: StreamCreateRequest):
             metadata=request.metadata,
             headers=request.headers,
             strict_live_ts=request.strict_live_ts,
-            use_sticky_session=request.use_sticky_session
+            use_sticky_session=request.use_sticky_session,
+            enable_silence_detection=request.enable_silence_detection,
+            silence_threshold_db=request.silence_threshold_db,
+            silence_duration=request.silence_duration,
+            silence_check_interval=request.silence_check_interval,
+            silence_failover_threshold=request.silence_failover_threshold,
+            silence_monitoring_grace_period=request.silence_monitoring_grace_period,
         )
 
         # Emit stream started event
@@ -816,7 +836,13 @@ async def create_transcode_stream(request: TranscodeCreateRequest):
             transcode_profile=profile_name,
             transcode_ffmpeg_args=ffmpeg_args,
             strict_live_ts=request.strict_live_ts,
-            use_sticky_session=request.use_sticky_session
+            use_sticky_session=request.use_sticky_session,
+            enable_silence_detection=request.enable_silence_detection,
+            silence_threshold_db=request.silence_threshold_db,
+            silence_duration=request.silence_duration,
+            silence_check_interval=request.silence_check_interval,
+            silence_failover_threshold=request.silence_failover_threshold,
+            silence_monitoring_grace_period=request.silence_monitoring_grace_period,
         )
 
         # Emit stream started event with transcoding info

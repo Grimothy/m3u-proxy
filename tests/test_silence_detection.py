@@ -89,6 +89,9 @@ class TestSilenceAnalysis:
         mock_process.communicate = AsyncMock(
             side_effect=asyncio.TimeoutError
         )
+        # kill() is synchronous on asyncio.subprocess.Process — use MagicMock
+        # so the unawaited-coroutine warning isn't triggered
+        mock_process.kill = MagicMock()
 
         with patch('asyncio.create_subprocess_exec', return_value=mock_process):
             result = await stream_manager._analyze_audio_silence(
@@ -96,6 +99,8 @@ class TestSilenceAnalysis:
             )
 
         assert result is False
+        mock_process.kill.assert_called_once()
+        mock_process.wait.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_ffmpeg_called_with_correct_args(self, stream_manager):

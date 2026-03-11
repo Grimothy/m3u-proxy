@@ -113,6 +113,14 @@ class StreamInfo:
     low_bitrate_count: int = 0
     bitrate_monitoring_started: bool = False
     # Silence detection - detect silent audio and trigger failover
+    # Per-stream overrides (None = fall back to global settings/ENV vars)
+    enable_silence_detection: Optional[bool] = None
+    silence_threshold_db: Optional[float] = None
+    silence_duration: Optional[float] = None
+    silence_check_interval: Optional[float] = None
+    silence_failover_threshold: Optional[int] = None
+    silence_monitoring_grace_period: Optional[float] = None
+    # Runtime state
     silence_check_start_time: Optional[float] = None
     silence_audio_buffer: bytes = b''
     silence_count: int = 0
@@ -296,7 +304,13 @@ class StreamManager:
             except Exception as e:
                 logger.error(f"Error emitting event: {e}")
 
-    async def _analyze_audio_silence(self, audio_data: bytes, stream_id: str) -> bool:
+    async def _analyze_audio_silence(
+        self,
+        audio_data: bytes,
+        stream_id: str,
+        threshold_db: Optional[float] = None,
+        duration: Optional[float] = None,
+    ) -> bool:
         """
         Analyze audio data for silence using ffmpeg's silencedetect filter.
 
@@ -308,6 +322,9 @@ class StreamManager:
         if not audio_data:
             return False
 
+        eff_threshold_db = threshold_db if threshold_db is not None else settings.SILENCE_THRESHOLD_DB
+        eff_duration = duration if duration is not None else settings.SILENCE_DURATION
+
         try:
             process = await asyncio.create_subprocess_exec(
                 'ffmpeg',
@@ -315,7 +332,7 @@ class StreamManager:
                 '-nostats',
                 '-i', 'pipe:0',
                 '-vn',
-                '-af', f'silencedetect=noise={settings.SILENCE_THRESHOLD_DB}dB:d={settings.SILENCE_DURATION}',
+                '-af', f'silencedetect=noise={eff_threshold_db}dB:d={eff_duration}',
                 '-f', 'null',
                 '-',
                 stdin=asyncio.subprocess.PIPE,
@@ -428,7 +445,13 @@ class StreamManager:
         transcode_profile: Optional[str] = None,
         transcode_ffmpeg_args: Optional[List[str]] = None,
         strict_live_ts: Optional[bool] = None,
-        use_sticky_session: Optional[bool] = None
+        use_sticky_session: Optional[bool] = None,
+        enable_silence_detection: Optional[bool] = None,
+        silence_threshold_db: Optional[float] = None,
+        silence_duration: Optional[float] = None,
+        silence_check_interval: Optional[float] = None,
+        silence_failover_threshold: Optional[int] = None,
+        silence_monitoring_grace_period: Optional[float] = None,
     ) -> str:
         """Get or create a stream and return its ID
 
@@ -445,6 +468,12 @@ class StreamManager:
             transcode_ffmpeg_args: FFmpeg arguments for transcoding
             strict_live_ts: Enable Strict Live TS Mode for this stream
             use_sticky_session: Enable Sticky Session Handler for this stream (defaults to config setting)
+            enable_silence_detection: Override global silence detection enable flag for this stream
+            silence_threshold_db: Override silence threshold in dB for this stream
+            silence_duration: Override minimum silence duration (s) for this stream
+            silence_check_interval: Override silence check window (s) for this stream
+            silence_failover_threshold: Override consecutive silence count before failover for this stream
+            silence_monitoring_grace_period: Override grace period (s) before monitoring starts for this stream
         """
         import hashlib
         stream_id = hashlib.md5(stream_url.encode()).hexdigest()
@@ -486,7 +515,13 @@ class StreamManager:
                 transcode_profile=transcode_profile,
                 transcode_ffmpeg_args=transcode_ffmpeg_args or [],
                 strict_live_ts=strict_live_ts or False,
-                use_sticky_session=effective_use_sticky_session
+                use_sticky_session=effective_use_sticky_session,
+                enable_silence_detection=enable_silence_detection,
+                silence_threshold_db=silence_threshold_db,
+                silence_duration=silence_duration,
+                silence_check_interval=silence_check_interval,
+                silence_failover_threshold=silence_failover_threshold,
+                silence_monitoring_grace_period=silence_monitoring_grace_period,
             )
             self.stream_clients[stream_id] = set()
 
@@ -1182,13 +1217,18 @@ class StreamManager:
                                     stream_info.bitrate_bytes_window = 0
 
                         # Silence detection - detect silent audio streams
-                        if settings.ENABLE_SILENCE_DETECTION and stream_info and not stream_info.is_vod:
+                        # Per-stream setting takes precedence over global ENV var
+                        silence_enabled = stream_info.enable_silence_detection if stream_info.enable_silence_detection is not None else settings.ENABLE_SILENCE_DETECTION
+                        if silence_enabled and stream_info and not stream_info.is_vod:
                             current_time = asyncio.get_event_loop().time()
+                            eff_grace = stream_info.silence_monitoring_grace_period if stream_info.silence_monitoring_grace_period is not None else settings.SILENCE_MONITORING_GRACE_PERIOD
+                            eff_interval = stream_info.silence_check_interval if stream_info.silence_check_interval is not None else settings.SILENCE_CHECK_INTERVAL
+                            eff_threshold = stream_info.silence_failover_threshold if stream_info.silence_failover_threshold is not None else settings.SILENCE_FAILOVER_THRESHOLD
 
                             if not stream_info.silence_monitoring_started:
                                 if stream_info.silence_check_start_time is None:
                                     stream_info.silence_check_start_time = current_time
-                                elif current_time - stream_info.silence_check_start_time >= settings.SILENCE_MONITORING_GRACE_PERIOD:
+                                elif current_time - stream_info.silence_check_start_time >= eff_grace:
                                     stream_info.silence_monitoring_started = True
                                     stream_info.silence_check_start_time = current_time
                                     stream_info.silence_audio_buffer = b''
@@ -1198,23 +1238,25 @@ class StreamManager:
                                     stream_info.silence_audio_buffer += chunk
 
                                 elapsed = current_time - (stream_info.silence_check_start_time or current_time)
-                                if elapsed >= settings.SILENCE_CHECK_INTERVAL:
+                                if elapsed >= eff_interval:
                                     audio_buffer = stream_info.silence_audio_buffer
                                     stream_info.silence_audio_buffer = b''
                                     stream_info.silence_check_start_time = current_time
 
                                     is_silent = await self._analyze_audio_silence(
-                                        audio_buffer, stream_id
+                                        audio_buffer, stream_id,
+                                        threshold_db=stream_info.silence_threshold_db,
+                                        duration=stream_info.silence_duration,
                                     )
 
                                     if is_silent:
                                         stream_info.silence_count += 1
                                         logger.warning(
                                             f"Silence detected for stream {stream_id}, "
-                                            f"count: {stream_info.silence_count}/{settings.SILENCE_FAILOVER_THRESHOLD}"
+                                            f"count: {stream_info.silence_count}/{eff_threshold}"
                                         )
 
-                                        if stream_info.silence_count >= settings.SILENCE_FAILOVER_THRESHOLD:
+                                        if stream_info.silence_count >= eff_threshold:
                                             has_failover = bool(
                                                 stream_info.failover_resolver_url or stream_info.failover_urls)
                                             if has_failover and failover_count < max_failovers:
