@@ -370,6 +370,9 @@ async def lifespan(app: FastAPI):
 
     await stream_manager.start()
 
+    # Start broadcast manager (launches GC background task)
+    await broadcast_manager.start()
+
     # Set up custom event handlers
     def log_event_handler(event: StreamEvent):
         """Simple event handler that logs all events"""

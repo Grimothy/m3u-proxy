@@ -107,6 +107,12 @@ class Settings(BaseSettings):
     BROADCAST_START_RETRY_COOLDOWN: float = 15.0
     BROADCAST_START_FAILURE_GRACE: float = 3.0  # seconds
 
+    # Broadcast HLS garbage collection configuration
+    # Periodically cleans orphaned .ts segments from broadcast directories
+    BROADCAST_GC_ENABLED: bool = True
+    BROADCAST_GC_INTERVAL: int = 300  # seconds (5 minutes)
+    BROADCAST_GC_AGE_THRESHOLD: int = 600  # seconds (10 minutes) - stale inactive broadcast dirs
+
     # API Authentication
     API_TOKEN: Optional[str] = None
 

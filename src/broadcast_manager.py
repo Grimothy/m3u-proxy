@@ -11,11 +11,12 @@ Manages FFmpeg processes for network broadcasting with:
 import asyncio
 import os
 import re
+import shutil
 import time
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 import httpx
 
@@ -525,6 +526,63 @@ class NetworkBroadcastProcess:
         path = os.path.join(self.hls_dir, safe_filename)
         return path if os.path.exists(path) else None
 
+    @staticmethod
+    def parse_playlist_segments(playlist_path: str) -> Set[str]:
+        """Parse an HLS playlist and return the set of referenced .ts segment filenames."""
+        segments: Set[str] = set()
+        try:
+            if not os.path.exists(playlist_path):
+                return segments
+            with open(playlist_path, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        # Segment lines are bare filenames like "live000042.ts"
+                        segments.add(os.path.basename(line))
+        except Exception as e:
+            logger.warning(f"Failed to parse playlist {playlist_path}: {e}")
+        return segments
+
+    def cleanup_orphaned_segments(self, age_threshold: int = 0) -> int:
+        """Remove .ts segment files not referenced by the current playlist.
+
+        Args:
+            age_threshold: Only remove segments older than this many seconds.
+                           0 means no age check (used during transitions when FFmpeg is stopped).
+
+        Returns the number of files removed.
+        """
+        playlist_path = os.path.join(self.hls_dir, "live.m3u8")
+        referenced = self.parse_playlist_segments(playlist_path)
+
+        removed = 0
+        now = time.time()
+        try:
+            for filename in list(os.listdir(self.hls_dir)):
+                if not filename.endswith(".ts"):
+                    continue
+                if filename not in referenced:
+                    filepath = os.path.join(self.hls_dir, filename)
+                    try:
+                        if age_threshold > 0:
+                            mtime = os.path.getmtime(filepath)
+                            if now - mtime <= age_threshold:
+                                continue
+                        os.remove(filepath)
+                        removed += 1
+                    except FileNotFoundError:
+                        pass  # Already removed between listdir and here
+                    except OSError as e:
+                        logger.warning(f"Failed to remove orphaned segment {filepath}: {e}")
+        except Exception as e:
+            logger.warning(f"Failed to scan broadcast dir {self.hls_dir}: {e}")
+
+        if removed:
+            logger.info(
+                f"Cleaned {removed} orphaned segment(s) from broadcast {self.network_id}"
+            )
+        return removed
+
 
 class BroadcastManager:
     """
@@ -561,9 +619,34 @@ class BroadcastManager:
             getattr(settings, "BROADCAST_START_FAILURE_GRACE", 2.0)
         )
 
+        # Broadcast GC configuration
+        self.gc_enabled = bool(
+            getattr(settings, "BROADCAST_GC_ENABLED", True)
+        )
+        self.gc_interval = int(
+            getattr(settings, "BROADCAST_GC_INTERVAL", 300)
+        )
+        self.gc_age_threshold = int(
+            getattr(settings, "BROADCAST_GC_AGE_THRESHOLD", 600)
+        )
+        self._gc_task: Optional[asyncio.Task] = None
+        self._running = False
+
         # Ensure base directory exists
         os.makedirs(self.hls_base_dir, exist_ok=True)
         logger.info(f"BroadcastManager initialized with base dir: {self.hls_base_dir}")
+
+    async def start(self):
+        """Start the broadcast manager background tasks (GC loop)."""
+        self._running = True
+        if self.gc_enabled:
+            self._gc_task = asyncio.create_task(self._gc_loop())
+            logger.info(
+                f"Broadcast GC enabled: interval={self.gc_interval}s, "
+                f"age_threshold={self.gc_age_threshold}s"
+            )
+        else:
+            logger.info("Broadcast GC disabled")
 
     async def start_broadcast(self, config: BroadcastConfig) -> BroadcastStatus:
         """
@@ -589,10 +672,13 @@ class BroadcastManager:
                     # Force discontinuity on transition
                     config.add_discontinuity = True
 
-                # Note: We intentionally do NOT delete the old playlist here.
-                # The old segments remain valid until FFmpeg's delete_segments removes them.
-                # The new FFmpeg will overwrite the playlist with a discontinuity marker,
-                # allowing players to smoothly transition to the new content.
+                # Clean up orphaned segments from the previous FFmpeg process.
+                # The old FFmpeg's delete_segments flag only managed its OWN playlist
+                # window. When it exits, ~hls_list_size segments remain on disk that the
+                # new FFmpeg process will never reference or clean up. Remove all .ts files
+                # not listed in the current playlist so they don't accumulate across
+                # programme transitions.
+                existing.cleanup_orphaned_segments()
 
                 del self.broadcasts[network_id]
 
@@ -785,8 +871,6 @@ class BroadcastManager:
             broadcast_dir = os.path.join(self.hls_base_dir, f"broadcast_{network_id}")
             if os.path.exists(broadcast_dir):
                 try:
-                    import shutil
-
                     shutil.rmtree(broadcast_dir)
                     logger.info(f"Cleaned up broadcast directory: {broadcast_dir}")
                     # Clear start attempts on successful cleanup
@@ -799,9 +883,143 @@ class BroadcastManager:
 
             return True
 
+    async def _gc_loop(self):
+        """Periodic garbage collection loop for broadcast directories."""
+        while self._running:
+            try:
+                await asyncio.sleep(self.gc_interval)
+                if not self._running:
+                    break
+                await self._gc_broadcast_dirs()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Broadcast GC loop error: {e}")
+
+    async def _gc_broadcast_dirs(self):
+        """Scan broadcast base directory and clean up orphaned segments and stale dirs.
+
+        For ACTIVE broadcasts: remove .ts files not referenced by the current playlist.
+        For INACTIVE broadcasts (no matching entry in self.broadcasts): remove the entire
+        directory if it is older than gc_age_threshold (crash recovery).
+        """
+        try:
+            try:
+                entries = os.listdir(self.hls_base_dir)
+            except Exception as e:
+                logger.warning(f"Failed to list broadcast base dir {self.hls_base_dir}: {e}")
+                return
+
+            now = time.time()
+            prefix = "broadcast_"
+            removed_segments = 0
+            removed_dirs = 0
+            skipped_active = 0
+            skipped_too_young = 0
+
+            # Snapshot active network IDs under lock, then release immediately.
+            # We intentionally do NOT hold the lock during I/O to avoid blocking
+            # start/stop operations. The 60-second age check on segment deletion
+            # and playlist re-validation before each delete provide safety against
+            # races with concurrent programme transitions.
+            async with self._lock:
+                active_network_ids = set(self.broadcasts.keys())
+
+            for entry in entries:
+                if not entry.startswith(prefix):
+                    continue
+
+                full_path = os.path.join(self.hls_base_dir, entry)
+                if not os.path.isdir(full_path):
+                    continue
+
+                # Extract network_id from directory name (broadcast_{network_id})
+                network_id = entry[len(prefix):]
+
+                if network_id in active_network_ids:
+                    # Active broadcast — clean orphaned segments not in current playlist
+                    skipped_active += 1
+                    playlist_path = os.path.join(full_path, "live.m3u8")
+                    referenced = NetworkBroadcastProcess.parse_playlist_segments(playlist_path)
+
+                    if not referenced:
+                        # No playlist or empty playlist — don't delete segments from
+                        # an active broadcast that may still be starting up
+                        continue
+
+                    for filename in list(os.listdir(full_path)):
+                        if not filename.endswith(".ts"):
+                            continue
+                        if filename not in referenced:
+                            filepath = os.path.join(full_path, filename)
+                            try:
+                                # Only remove segments older than 60s to avoid
+                                # deleting segments that FFmpeg just wrote but
+                                # hasn't added to the playlist yet
+                                mtime = os.path.getmtime(filepath)
+                                if now - mtime > 60:
+                                    # Re-read the playlist before deleting to guard
+                                    # against races with programme transitions that
+                                    # may have rewritten the playlist since our
+                                    # initial read.
+                                    fresh_referenced = NetworkBroadcastProcess.parse_playlist_segments(playlist_path)
+                                    if filename not in fresh_referenced:
+                                        os.remove(filepath)
+                                        removed_segments += 1
+                            except FileNotFoundError:
+                                pass  # Already removed between listdir and here
+                            except OSError:
+                                pass
+                else:
+                    # Inactive broadcast — check age and remove entire directory
+                    try:
+                        mtime = os.path.getmtime(full_path)
+                    except FileNotFoundError:
+                        continue  # Directory removed between listdir and here
+                    except Exception:
+                        continue
+
+                    age = now - mtime
+                    if age > self.gc_age_threshold:
+                        try:
+                            shutil.rmtree(full_path)
+                            removed_dirs += 1
+                            logger.info(
+                                f"Removed stale broadcast dir: {full_path} (age: {int(age)}s)"
+                            )
+                        except Exception as e:
+                            logger.warning(f"Failed to remove broadcast dir {full_path}: {e}")
+                    else:
+                        skipped_too_young += 1
+
+            if removed_segments or removed_dirs:
+                logger.info(
+                    f"Broadcast GC: removed {removed_segments} orphaned segment(s), "
+                    f"{removed_dirs} stale dir(s), scanned {skipped_active} active broadcast(s), "
+                    f"skipped {skipped_too_young} too-young dir(s)"
+                )
+            elif skipped_active or skipped_too_young:
+                logger.debug(
+                    f"Broadcast GC: no cleanup needed, scanned {skipped_active} active broadcast(s), "
+                    f"skipped {skipped_too_young} too-young dir(s)"
+                )
+
+        except Exception as e:
+            logger.error(f"Error during broadcast GC: {e}")
+
     async def shutdown(self):
-        """Stop all broadcasts gracefully."""
+        """Stop all broadcasts and background tasks gracefully."""
         logger.info("Shutting down BroadcastManager...")
+        self._running = False
+
+        # Cancel GC task
+        if self._gc_task and not self._gc_task.done():
+            self._gc_task.cancel()
+            try:
+                await self._gc_task
+            except asyncio.CancelledError:
+                pass
+
         async with self._lock:
             for network_id, process in list(self.broadcasts.items()):
                 try:
