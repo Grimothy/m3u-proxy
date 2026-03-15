@@ -48,6 +48,8 @@ class BroadcastConfig:
     callback_url: Optional[str] = None
     # Optional custom headers to include when FFmpeg fetches the input URL
     headers: Optional[Dict[str, str]] = None
+    # Optional output directory for HLS segments (overrides default hls_base_dir)
+    output_dir: Optional[str] = None
 
 
 @dataclass
@@ -597,7 +599,9 @@ class BroadcastManager:
                 del self.broadcasts[network_id]
 
             # Create and start new process
-            process = NetworkBroadcastProcess(config, self.hls_base_dir)
+            # Use config.output_dir if provided, otherwise fall back to self.hls_base_dir
+            hls_dir = config.output_dir or self.hls_base_dir
+            process = NetworkBroadcastProcess(config, hls_dir)
 
             # Check start retry policy
             now = time.time()

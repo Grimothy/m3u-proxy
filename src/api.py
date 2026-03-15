@@ -2146,6 +2146,7 @@ class BroadcastStartRequest(BaseModel):
     hwaccel: Optional[str] = None
     callback_url: Optional[str] = None
     headers: Optional[Dict[str, str]] = None
+    output_dir: Optional[str] = None
 
     @field_validator("stream_url")
     @classmethod
@@ -2225,6 +2226,7 @@ async def start_broadcast(
             hwaccel=request.hwaccel,
             callback_url=request.callback_url,
             headers=request.headers,
+            output_dir=request.output_dir,
         )
         status = await broadcast_manager.start_broadcast(config)
         return BroadcastStatusResponse(
