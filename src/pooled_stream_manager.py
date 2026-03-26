@@ -1054,7 +1054,7 @@ class PooledStreamManager:
 
             # Check if URL has changed (failover scenario) or if process has failed
             url_changed = process.url != url
-            process_failed = process.status == "failed" or (
+            process_failed = process.status in ("failed", "input_failed") or (
                 process.process and process.process.returncode is not None
             )
 
@@ -1103,6 +1103,10 @@ class PooledStreamManager:
             self.shared_processes[stream_key] = process
             await process.add_client(client_id)
             self.client_streams[client_id] = stream_key
+
+            # Restore stream_id -> stream_key mapping (may have been deleted by _cleanup_local_process)
+            if stream_id:
+                self.stream_key_to_id[stream_key] = stream_id
 
             # Register in Redis
             if self.redis_client:

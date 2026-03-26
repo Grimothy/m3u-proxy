@@ -2,9 +2,11 @@ from fastapi import FastAPI, HTTPException, Query, Response, Request, Depends, H
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+import asyncio
 import logging
 import hashlib
 import subprocess
+import uuid
 from urllib.parse import unquote, urlparse
 from typing import Optional, List, Dict
 from pydantic import BaseModel, field_validator
@@ -43,18 +45,19 @@ def get_ffmpeg_version() -> Optional[str]:
 
 def get_content_type(url: str) -> str:
     """Determine content type based on URL extension"""
-    url_lower = url.lower()
-    if url_lower.endswith((".ts", "?profile=pass")):
+    # Split off query string before checking extension
+    path = str(url).split("?")[0].lower()
+    if path.endswith(".ts") or str(url).lower().endswith("?profile=pass"):
         return "video/mp2t"
-    elif url_lower.endswith(".m3u8"):
+    elif path.endswith(".m3u8"):
         return "application/vnd.apple.mpegurl"
-    elif url_lower.endswith(".mp4"):
+    elif path.endswith(".mp4"):
         return "video/mp4"
-    elif url_lower.endswith(".mkv"):
+    elif path.endswith(".mkv"):
         return "video/x-matroska"
-    elif url_lower.endswith(".webm"):
+    elif path.endswith(".webm"):
         return "video/webm"
-    elif url_lower.endswith(".avi"):
+    elif path.endswith(".avi"):
         return "video/x-msvideo"
     else:
         return "application/octet-stream"
@@ -62,9 +65,15 @@ def get_content_type(url: str) -> str:
 
 def is_direct_stream(url: str) -> bool:
     """Check if URL is a direct stream (not HLS playlist)"""
+    # Split off query string before checking extension
+    path = str(url).split("?")[0].lower()
+    # M3U8 URLs are always HLS, even if /live/ appears in the path
+    if path.endswith(".m3u8"):
+        return False
     return (
-        url.lower().endswith((".ts", ".mp4", ".mkv", ".webm", ".avi", "?profile=pass"))
-        or "/live/" in url
+        path.endswith((".ts", ".mp4", ".mkv", ".webm", ".avi"))
+        or str(url).lower().endswith("?profile=pass")
+        or "/live/" in str(url)
     )
 
 
@@ -369,6 +378,7 @@ async def lifespan(app: FastAPI):
     stream_manager.set_event_manager(event_manager)
 
     await stream_manager.start()
+    await broadcast_manager.start()
 
     # Set up custom event handlers
     def log_event_handler(event: StreamEvent):
@@ -980,14 +990,40 @@ async def get_hls_playlist(
 ):
     """Get HLS playlist for a stream (supports both direct proxy and transcoded HLS streams)"""
     try:
-        # Generate or reuse client ID based on request characteristics
-        # Use IP + User-Agent + Stream ID to create a consistent client ID
+        # Generate or reuse client ID based on request characteristics.
+        # The deterministic hash lets the same device reconnect to the same
+        # client record.  However, two devices behind the same NAT with the
+        # same User-Agent produce an identical hash.  If the existing client
+        # record still has an active connection (different device), we must
+        # create a unique client ID — otherwise cleanup_client for one device
+        # deletes the shared record and kills the other device's stream.
         if not client_id:
             client_info_data = get_client_info(request)
+            username_part = client_info_data.get("username") or ""
             client_hash = hashlib.md5(
-                f"{client_info_data['ip_address']}-{client_info_data['user_agent']}-{stream_id}".encode()
+                f"{client_info_data['ip_address']}-{client_info_data['user_agent']}-{stream_id}-{username_part}".encode()
             ).hexdigest()[:16]
             client_id = f"client_{client_hash}"
+
+            # Collision check: if this client_id already has an active
+            # connection on the same stream, this is a different device.
+            if (
+                client_id in stream_manager.clients
+                and stream_manager.clients[client_id].stream_id == stream_id
+                and stream_manager.clients[client_id].active_connection_id
+                and stream_manager.clients[client_id].active_connection_id
+                in stream_manager.connection_cancel_events
+                and not stream_manager.connection_cancel_events[
+                    stream_manager.clients[client_id].active_connection_id
+                ].is_set()
+            ):
+                # Active connection exists — make this client unique
+                unique_suffix = uuid.uuid4().hex[:8]
+                client_id = f"client_{client_hash}_{unique_suffix}"
+                logger.info(
+                    f"Client ID collision detected for stream {stream_id}, "
+                    f"assigning unique ID: {client_id}"
+                )
 
         # Only register client if not already registered for this stream
         if (
@@ -1173,6 +1209,64 @@ async def get_hls_segment_ts(
     return await get_hls_segment(stream_id, request, client_id, url)
 
 
+def _start_disconnect_monitor(
+    request: Request, client_id: str, sm: StreamManager
+) -> None:
+    """Start a background task that detects ASGI client disconnect and sets cancel_event.
+
+    When a client disconnects, the ASGI receive channel delivers an
+    ``http.disconnect`` message.  We set the connection's cancel_event AND
+    directly signal broadcast subscribers.  We cannot rely on the streaming
+    generator to reach post-loop cleanup because Starlette stops iterating
+    the generator once the client is gone — the generator stays suspended at
+    ``yield`` and only its ``finally`` blocks run during GC.
+    """
+    client_info = sm.clients.get(client_id)
+    if not client_info or not client_info.active_connection_id:
+        return
+
+    conn_id = client_info.active_connection_id
+    stream_id = client_info.stream_id
+    cancel_event = sm.connection_cancel_events.get(conn_id)
+    if not cancel_event:
+        return
+
+    async def _monitor() -> None:
+        try:
+            while not cancel_event.is_set():
+                message = await request.receive()
+                if message.get("type") == "http.disconnect":
+                    if not cancel_event.is_set():
+                        logger.info(
+                            f"ASGI disconnect detected for client {client_id} "
+                            f"(connection {conn_id}), setting cancel event"
+                        )
+                        cancel_event.set()
+
+                    # If this client was the primary reader for a broadcast
+                    # stream, signal subscribers immediately so they can
+                    # promote without waiting for the generator's post-loop
+                    # cleanup (which may never run — see docstring).
+                    if (
+                        stream_id
+                        and stream_id in sm._direct_broadcast_primary
+                        and sm._direct_broadcast_primary[stream_id] == conn_id
+                    ):
+                        logger.info(
+                            f"ASGI disconnect: signaling subscribers for "
+                            f"stream {stream_id} (primary was {client_id})"
+                        )
+                        sm._signal_subscribers_end(stream_id)
+
+                    return
+        except Exception:
+            # Connection already closed or error reading — set cancel to be safe
+            if not cancel_event.is_set():
+                cancel_event.set()
+
+    asyncio.create_task(_monitor())
+
+
 @app.get("/stream/{stream_id}")
 async def get_direct_stream(
     request: Request,
@@ -1187,14 +1281,40 @@ async def get_direct_stream(
         stream_info = stream_manager.streams[stream_id]
         stream_url = stream_info.current_url or stream_info.original_url
 
-        # Generate or reuse client ID based on request characteristics
-        # Use IP + User-Agent + Stream ID to create a consistent client ID
+        # Generate or reuse client ID based on request characteristics.
+        # The deterministic hash lets the same device reconnect to the same
+        # client record.  However, two devices behind the same NAT with the
+        # same User-Agent produce an identical hash.  If the existing client
+        # record still has an active connection (different device), we must
+        # create a unique client ID — otherwise cleanup_client for one device
+        # deletes the shared record and kills the other device's stream.
         if not client_id:
             client_info_data = get_client_info(request)
+            username_part = client_info_data.get("username") or ""
             client_hash = hashlib.md5(
-                f"{client_info_data['ip_address']}-{client_info_data['user_agent']}-{stream_id}".encode()
+                f"{client_info_data['ip_address']}-{client_info_data['user_agent']}-{stream_id}-{username_part}".encode()
             ).hexdigest()[:16]
             client_id = f"client_{client_hash}"
+
+            # Collision check: if this client_id already has an active
+            # connection on the same stream, this is a different device.
+            if (
+                client_id in stream_manager.clients
+                and stream_manager.clients[client_id].stream_id == stream_id
+                and stream_manager.clients[client_id].active_connection_id
+                and stream_manager.clients[client_id].active_connection_id
+                in stream_manager.connection_cancel_events
+                and not stream_manager.connection_cancel_events[
+                    stream_manager.clients[client_id].active_connection_id
+                ].is_set()
+            ):
+                # Active connection exists — make this client unique
+                unique_suffix = uuid.uuid4().hex[:8]
+                client_id = f"client_{client_hash}_{unique_suffix}"
+                logger.info(
+                    f"Client ID collision detected for stream {stream_id}, "
+                    f"assigning unique ID: {client_id}"
+                )
 
         # Only register client if not already registered for this stream
         if (
@@ -1248,9 +1368,17 @@ async def get_direct_stream(
         else:
             # Use direct proxy for continuous streams
             # This provides true byte-for-byte proxying with per-client connections
-            return await stream_manager.stream_continuous_direct(
+            response = await stream_manager.stream_continuous_direct(
                 stream_id, client_id, range_header=range_header
             )
+
+            # Start ASGI disconnect monitor so the generator exits promptly
+            # when the client disconnects.  Without this, the primary generator
+            # stays stuck in reconnect/failover loops because GeneratorExit is
+            # not reliably delivered with uvloop.
+            _start_disconnect_monitor(request, client_id, stream_manager)
+
+            return response
 
     except HTTPException:
         raise
@@ -1521,8 +1649,9 @@ async def get_streams_by_metadata(
         if stream_info.is_variant_stream:
             continue
 
-        # Check metadata field match
-        if stream_info.metadata.get(field) != value:
+        # Check metadata field match (compare as strings to avoid type
+        # mismatch — query params are always str, metadata values may be int/bool)
+        if str(stream_info.metadata.get(field, "")) != str(value):
             continue
 
         # Count only ACTIVE clients, not all clients in the set
@@ -1568,6 +1697,52 @@ async def get_streams_by_metadata(
         "total_matching": len(matching_streams),
         "total_clients": sum(stream["client_count"] for stream in matching_streams),
     }
+
+
+@app.get("/streams/counts-by-metadata", dependencies=[Depends(verify_token)])
+async def get_streams_counts_by_metadata(
+    field: str = Query(..., description="Metadata field to group by"),
+    values: str = Query(..., description="Comma-separated values to count"),
+    active_only: bool = Query(
+        True, description="Only count streams with active clients"
+    ),
+):
+    """
+    Return a stream count per metadata value in a single request.
+
+    Instead of calling /streams/by-metadata once per value (e.g. once per
+    provider profile), callers can pass all values at once and get a
+    {value: count} map back, iterating stream_manager.streams only once.
+    """
+    requested = [v.strip() for v in values.split(",") if v.strip()]
+    counts = {v: 0 for v in requested}
+
+    for stream_id, stream_info in stream_manager.streams.items():
+        if stream_info.is_variant_stream:
+            continue
+
+        if not stream_info.is_active:
+            continue
+
+        field_value = str(stream_info.metadata.get(field, ""))
+        if field_value not in counts:
+            continue
+
+        if active_only:
+            active_client_count = 0
+            if stream_id in stream_manager.stream_clients:
+                for client_id in stream_manager.stream_clients[stream_id]:
+                    if (
+                        client_id in stream_manager.clients
+                        and stream_manager.clients[client_id].is_connected
+                    ):
+                        active_client_count += 1
+            if active_client_count == 0:
+                continue
+
+        counts[field_value] += 1
+
+    return {"field": field, "counts": counts}
 
 
 @app.get("/streams/{stream_id}", dependencies=[Depends(verify_token)])
