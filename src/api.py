@@ -326,8 +326,8 @@ class TranscodeCreateRequest(BaseModel):
     resolver_args: Optional[str] = (
         None  # Quality/format + optional flags (e.g. "best", "bestvideo+bestaudio")
     )
-    cookies: Optional[str] = (
-        None  # Netscape-format cookies.txt content for authenticated streams
+    cookies_path: Optional[str] = (
+        None  # Absolute path to a Netscape-format cookies.txt file on the proxy host
     )
 
     @field_validator("url")
@@ -865,7 +865,7 @@ async def create_transcode_stream(request: TranscodeCreateRequest):
                 transcode_ffmpeg_args=[],
                 resolver_type=resolver_name,
                 resolver_args=resolver_args,
-                resolver_cookies=request.cookies,
+                resolver_cookies_path=request.cookies_path,
                 strict_live_ts=request.strict_live_ts,
                 use_sticky_session=request.use_sticky_session,
             )
@@ -2300,6 +2300,31 @@ async def trigger_failover(stream_id: str):
     except Exception as e:
         logger.error(f"Error triggering failover: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/validate-cookies-file", dependencies=[Depends(verify_token)])
+async def validate_cookies_file(
+    path: str = Query(
+        ..., description="Absolute path to the cookies file on the proxy host"
+    ),
+):
+    """Check that a cookies file path exists and is readable on the proxy host.
+
+    Used by the editor to verify a user-supplied path before saving the stream profile.
+    Returns a JSON object with `valid` (bool) and `message` (str).
+    """
+    if not path or not path.strip():
+        return {"valid": False, "message": "Path is empty."}
+
+    try:
+        if not os.path.isfile(path):
+            return {"valid": False, "message": f"File not found: {path}"}
+        if not os.access(path, os.R_OK):
+            return {"valid": False, "message": f"File is not readable: {path}"}
+        return {"valid": True, "message": "File exists and is readable."}
+    except Exception as e:
+        logger.warning(f"cookies file validation error for path {path!r}: {e}")
+        return {"valid": False, "message": f"Unexpected error: {e}"}
 
 
 @app.get("/health", dependencies=[Depends(verify_token)])
