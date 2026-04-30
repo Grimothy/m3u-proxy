@@ -6,6 +6,7 @@ A high-performance IPTV streaming proxy with client management and failover supp
 
 import uvicorn
 import logging
+import logging.handlers
 import sys
 import os
 import asyncio
@@ -29,10 +30,24 @@ def main():
         use_uvloop = False
 
     # Configure logging
+    log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     logging.basicConfig(
         level=settings.LOG_LEVEL.upper(),
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        format=log_format
     )
+
+    # Add rotating file handler so logs are persisted to the mounted volume
+    log_dir = settings.LOG_DIR
+    os.makedirs(log_dir, exist_ok=True)
+    file_handler = logging.handlers.RotatingFileHandler(
+        os.path.join(log_dir, settings.LOG_FILE),
+        maxBytes=10 * 1024 * 1024,  # 10 MB per file
+        backupCount=5,
+        encoding="utf-8",
+    )
+    file_handler.setLevel(settings.LOG_LEVEL.upper())
+    file_handler.setFormatter(logging.Formatter(log_format))
+    logging.getLogger().addHandler(file_handler)
 
     logger = logging.getLogger(__name__)
     logger.info("="*60)

@@ -67,6 +67,7 @@ class Settings(BaseSettings):
     DEFAULT_RETRY_ATTEMPTS: int = 3
     DEFAULT_RETRY_DELAY: int = 5
     TEMP_DIR: str = "/tmp/m3u-proxy-streams"
+    LOG_DIR: str = "logs"
     LOG_FILE: str = "m3u-proxy.log"
 
     # Redis Configuration for pooling and multi-worker coordination

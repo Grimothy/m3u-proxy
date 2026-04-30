@@ -240,9 +240,7 @@ class TestSegmentContentType:
         )
 
     def test_mp4_returns_video_mp4(self):
-        assert (
-            StreamManager._segment_content_type("http://x/y/init.mp4") == "video/mp4"
-        )
+        assert StreamManager._segment_content_type("http://x/y/init.mp4") == "video/mp4"
 
     def test_aac_returns_audio_aac(self):
         assert (
@@ -255,9 +253,7 @@ class TestSegmentContentType:
         )
 
     def test_unknown_defaults_to_mpeg_ts(self):
-        assert (
-            StreamManager._segment_content_type("http://x/y/seg.xyz") == "video/mp2t"
-        )
+        assert StreamManager._segment_content_type("http://x/y/seg.xyz") == "video/mp2t"
         assert StreamManager._segment_content_type("http://x/y/seg") == "video/mp2t"
 
     def test_case_insensitive(self):
