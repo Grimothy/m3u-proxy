@@ -115,7 +115,8 @@ class NetworkBroadcastProcess:
         self._poll_task: Optional[asyncio.Task] = None
         self._stopping = False
         self._bytes_written: int = 0  # Cumulative bytes across all segments ever seen
-        self._seen_segments: Set[str] = set()  # Segment filenames already counted
+        # Segment filenames already counted
+        self._seen_segments: Set[str] = set()
 
     def _build_ffmpeg_command(self) -> List[str]:
         """Build the FFmpeg command for HLS broadcast output."""
@@ -371,7 +372,8 @@ class NetworkBroadcastProcess:
         "time=",  # Time stats
         "bitrate=",  # Bitrate stats
         "speed=",  # Speed stats
-        "size=",  # Size stats (N/A for HLS stream-copy; tracked via segment polling)
+        # Size stats (N/A for HLS stream-copy; tracked via segment polling)
+        "size=",
         "resumed reading",  # Reconnection noise
         "opening",  # File opening messages (lowercase)
         "muxing overhead",  # Summary stats
@@ -715,6 +717,9 @@ class BroadcastManager:
         self.hls_base_dir = hls_base_dir or getattr(
             settings, "HLS_BROADCAST_DIR", "/tmp/m3u-proxy-broadcasts"
         )
+        self.dvr_base_dir: str = getattr(
+            settings, "DVR_RECORDING_DIR", "/tmp/m3u-proxy-dvr"
+        )
         self.broadcasts: Dict[str, NetworkBroadcastProcess] = {}
         self._lock = asyncio.Lock()
 
@@ -922,10 +927,16 @@ class BroadcastManager:
     async def read_playlist(self, network_id: str) -> Optional[str]:
         """Read the HLS playlist content for a network."""
         if network_id not in self.broadcasts:
-            # Check if directory exists even without active broadcast (for recovery)
-            playlist_path = os.path.join(
-                self.hls_base_dir, f"broadcast_{network_id}", "live.m3u8"
-            )
+            # Check if directory exists even without active broadcast (for recovery).
+            # DVR recordings use dvr_base_dir; live broadcasts use hls_base_dir.
+            for base_dir in (self.dvr_base_dir, self.hls_base_dir):
+                playlist_path = os.path.join(
+                    base_dir, f"broadcast_{network_id}", "live.m3u8"
+                )
+                if os.path.exists(playlist_path):
+                    break
+            else:
+                return None
             if os.path.exists(playlist_path):
                 try:
                     with open(playlist_path, "r") as f:
@@ -958,11 +969,15 @@ class BroadcastManager:
         if network_id in self.broadcasts:
             return self.broadcasts[network_id].get_segment_path(filename)
 
-        # Check directory even without active broadcast
-        segment_path = os.path.join(
-            self.hls_base_dir, f"broadcast_{network_id}", safe_filename
-        )
-        return segment_path if os.path.exists(segment_path) else None
+        # Check directory even without active broadcast.
+        # DVR recordings use dvr_base_dir; live broadcasts use hls_base_dir.
+        for base_dir in (self.dvr_base_dir, self.hls_base_dir):
+            segment_path = os.path.join(
+                base_dir, f"broadcast_{network_id}", safe_filename
+            )
+            if os.path.exists(segment_path):
+                return segment_path
+        return None
 
     async def cleanup_broadcast(self, network_id: str) -> bool:
         """Clean up broadcast directory and files."""
