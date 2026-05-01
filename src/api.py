@@ -3,6 +3,7 @@ from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import asyncio
+import json
 import logging
 import hashlib
 import subprocess
@@ -324,7 +325,8 @@ class TranscodeCreateRequest(BaseModel):
     # Stream resolver backend - when set, bypasses FFmpeg and uses the specified tool
     resolver: Optional[Literal["streamlink", "ytdlp"]] = None
     resolver_args: Optional[str] = (
-        None  # Quality/format + optional flags (e.g. "best", "bestvideo+bestaudio")
+        # Quality/format + optional flags (e.g. "best", "bestvideo+bestaudio")
+        None
     )
     cookies_path: Optional[str] = (
         None  # Absolute path to a Netscape-format cookies.txt file on the proxy host
@@ -2325,6 +2327,135 @@ async def validate_cookies_file(
     except Exception as e:
         logger.warning(f"cookies file validation error for path {path!r}: {e}")
         return {"valid": False, "message": f"Unexpected error: {e}"}
+
+
+class YtDlpMetadataRequest(BaseModel):
+    """Request body for the /ytdlp/metadata endpoint."""
+
+    url: str
+    cookies_path: Optional[str] = (
+        None  # Absolute path to a Netscape-format cookies.txt file on the proxy host
+    )
+    # yt-dlp format selector (e.g. 'best', 'bestvideo+bestaudio/best')
+    format: Optional[str] = None
+    # Use --flat-playlist (returns list of entries instead of single JSON)
+    flat_playlist: bool = False
+
+    @field_validator("url")
+    @classmethod
+    def validate_url_field(cls, v):
+        return validate_url(v)
+
+    @field_validator("cookies_path")
+    @classmethod
+    def validate_cookies_path_field(cls, v):
+        if v is not None:
+            v = v.strip()
+            if not v:
+                return None
+            if not os.path.isabs(v):
+                raise ValueError("cookies_path must be an absolute path")
+        return v
+
+
+@app.post("/ytdlp/metadata", dependencies=[Depends(verify_token)])
+async def ytdlp_metadata(request: YtDlpMetadataRequest):
+    """
+    Run yt-dlp on a URL and return the metadata JSON.
+
+    When `flat_playlist=true`, runs with --flat-playlist and returns
+    `{"entries": [...]}` (one object per playlist entry).
+    Otherwise returns the single JSON object for the URL.
+
+    Primarily used by the YouTubearr plugin to check live-stream status
+    and fetch channel/video metadata without requiring yt-dlp to be
+    installed on the editor host.
+    """
+    if not settings.YTDLP_ENABLED:
+        raise HTTPException(
+            status_code=400,
+            detail="yt-dlp resolver is disabled (YTDLP_ENABLED=false)",
+        )
+
+    if not get_resolver_version("yt-dlp"):
+        raise HTTPException(
+            status_code=503,
+            detail="yt-dlp is not installed or not accessible on this proxy host",
+        )
+
+    cookies_path = request.cookies_path
+    if cookies_path:
+        if not os.path.isfile(cookies_path):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cookies file not found on proxy host: {cookies_path}",
+            )
+        if not os.access(cookies_path, os.R_OK):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cookies file is not readable on proxy host: {cookies_path}",
+            )
+
+    cmd = ["yt-dlp", "--dump-json", "--no-download", "--no-warnings"]
+
+    if request.flat_playlist:
+        cmd.append("--flat-playlist")
+
+    if request.format:
+        cmd.extend(["--format", request.format])
+
+    if cookies_path:
+        cmd.extend(["--cookies", cookies_path])
+
+    cmd.append(request.url)
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60.0)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            raise HTTPException(status_code=504, detail="yt-dlp timed out")
+
+        stdout_text = stdout.decode("utf-8", errors="replace").strip()
+        stderr_text = stderr.decode("utf-8", errors="replace").strip()
+
+        if proc.returncode != 0 or not stdout_text:
+            raise HTTPException(
+                status_code=422,
+                detail=f"yt-dlp exited with code {proc.returncode}: {stderr_text[:500]}",
+            )
+
+        if request.flat_playlist:
+            entries = []
+            for line in stdout_text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+            return {"entries": entries}
+
+        try:
+            return json.loads(stdout_text)
+        except json.JSONDecodeError:
+            raise HTTPException(
+                status_code=422,
+                detail="Failed to parse yt-dlp output as JSON",
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"yt-dlp metadata error for {request.url!r}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/health", dependencies=[Depends(verify_token)])
