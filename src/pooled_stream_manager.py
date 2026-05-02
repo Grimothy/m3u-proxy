@@ -640,12 +640,14 @@ class SharedTranscodingProcess:
                     if not line_str:
                         continue
 
-                    # Log FFmpeg output and capture media info / live progress.
+                    # Skip debug logging for periodic progress lines (~2/s per stream) —
+                    # they're already captured into media_info and add no diagnostic value.
+                    if "bitrate=" not in line_str and "fps=" not in line_str:
+                        logger.debug(f"FFmpeg [{self.stream_id}]: {line_str}")
                     # Skip parsers for resolver (yt-dlp/streamlink) stderr — their
                     # output format is not ffmpeg's, so the regexes won't match but
                     # a coincidental "fps=" or "bitrate=" in debug output could
                     # populate stale values.
-                    logger.debug(f"FFmpeg [{self.stream_id}]: {line_str}")
                     if not self.resolver_type:
                         self._parse_ffmpeg_input_line(line_str)
                         self._parse_ffmpeg_stream_line(line_str)
