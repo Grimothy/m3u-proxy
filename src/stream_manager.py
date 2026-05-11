@@ -1358,6 +1358,7 @@ class StreamManager:
             chunk_count = 0
             response = None
             stream_context = None
+            stream_iterator = None
             last_stats_update = 0  # Track bytes at last stats update
             vod_reconnects = 0
             failover_count = 0
