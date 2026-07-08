@@ -3,6 +3,7 @@ from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import asyncio
+import json
 import logging
 import hashlib
 import subprocess
@@ -324,10 +325,11 @@ class TranscodeCreateRequest(BaseModel):
     # Stream resolver backend - when set, bypasses FFmpeg and uses the specified tool
     resolver: Optional[Literal["streamlink", "ytdlp"]] = None
     resolver_args: Optional[str] = (
-        None  # Quality/format + optional flags (e.g. "best", "bestvideo+bestaudio")
+        # Quality/format + optional flags (e.g. "best", "bestvideo+bestaudio")
+        None
     )
-    cookies: Optional[str] = (
-        None  # Netscape-format cookies.txt content for authenticated streams
+    cookies_path: Optional[str] = (
+        None  # Absolute path to a Netscape-format cookies.txt file on the proxy host
     )
 
     @field_validator("url")
@@ -525,7 +527,10 @@ async def custom_swagger_ui_html():
 @app.get("/static/{filename:path}", include_in_schema=False)
 async def serve_static_file(filename: str):
     """Serve static files like logo and favicon"""
-    file_path = os.path.join(static_path, filename)
+    static_root = os.path.realpath(static_path)
+    file_path = os.path.realpath(os.path.join(static_path, filename))
+    if not file_path.startswith(static_root + os.sep):
+        raise HTTPException(status_code=403, detail="Access denied")
     if os.path.exists(file_path) and os.path.isfile(file_path):
         # Determine media type based on extension
         if filename.endswith(".svg"):
@@ -865,7 +870,7 @@ async def create_transcode_stream(request: TranscodeCreateRequest):
                 transcode_ffmpeg_args=[],
                 resolver_type=resolver_name,
                 resolver_args=resolver_args,
-                resolver_cookies=request.cookies,
+                resolver_cookies_path=request.cookies_path,
                 strict_live_ts=request.strict_live_ts,
                 use_sticky_session=request.use_sticky_session,
             )
@@ -1321,6 +1326,28 @@ async def get_hls_segment_ts(
     return await get_hls_segment(stream_id, request, client_id, url)
 
 
+@app.get("/hls/{stream_id}/segment.m4s")
+async def get_hls_segment_m4s(
+    stream_id: str,
+    request: Request,
+    client_id: str = Query(..., description="Client ID"),
+    url: str = Query(..., description="The segment URL to proxy"),
+):
+    """Proxy fMP4/CMAF HLS segment (used for HEVC and Apple AVKit playback)."""
+    return await get_hls_segment(stream_id, request, client_id, url)
+
+
+@app.get("/hls/{stream_id}/segment.mp4")
+async def get_hls_segment_mp4(
+    stream_id: str,
+    request: Request,
+    client_id: str = Query(..., description="Client ID"),
+    url: str = Query(..., description="The segment URL to proxy"),
+):
+    """Proxy fMP4 HLS init segment (EXT-X-MAP) or .mp4 segment file."""
+    return await get_hls_segment(stream_id, request, client_id, url)
+
+
 def _start_disconnect_monitor(
     request: Request, client_id: str, sm: StreamManager
 ) -> None:
@@ -1332,7 +1359,14 @@ def _start_disconnect_monitor(
     generator to reach post-loop cleanup because Starlette stops iterating
     the generator once the client is gone — the generator stays suspended at
     ``yield`` and only its ``finally`` blocks run during GC.
+
+    Set DISABLE_ASGI_DISCONNECT_MONITOR=true to skip this and rely solely on
+    the periodic cleanup / chunk-timeout paths (useful for testing that path
+    without a real reverse proxy in front).
     """
+    if settings.DISABLE_ASGI_DISCONNECT_MONITOR:
+        return
+
     client_info = sm.clients.get(client_id)
     if not client_info or not client_info.active_connection_id:
         return
@@ -1409,24 +1443,51 @@ async def get_direct_stream(
             client_id = f"client_{client_hash}"
 
             # Collision check: if this client_id already has an active
-            # connection on the same stream, this is a different device.
+            # connection on the same stream, decide whether to reuse or fork.
+            #
+            # A zombie connection (client dropped behind a reverse proxy where
+            # http.disconnect never arrives) has a non-set cancel event but
+            # stale last_data_time — it looks "active" but is dead.  Forking a
+            # unique suffix for a zombie causes client IDs to accumulate and
+            # holds a provider connection slot open indefinitely.
+            #
+            # Strategy:
+            #   - data stale > chunk_timeout → zombie; evict old, reuse ID
+            #   - data fresh                → genuinely concurrent device; fork
+            existing = stream_manager.clients.get(client_id)
             if (
-                client_id in stream_manager.clients
-                and stream_manager.clients[client_id].stream_id == stream_id
-                and stream_manager.clients[client_id].active_connection_id
-                and stream_manager.clients[client_id].active_connection_id
+                existing is not None
+                and existing.stream_id == stream_id
+                and existing.active_connection_id
+                and existing.active_connection_id
                 in stream_manager.connection_cancel_events
                 and not stream_manager.connection_cancel_events[
-                    stream_manager.clients[client_id].active_connection_id
+                    existing.active_connection_id
                 ].is_set()
             ):
-                # Active connection exists — make this client unique
-                unique_suffix = uuid.uuid4().hex[:8]
-                client_id = f"client_{client_hash}_{unique_suffix}"
-                logger.info(
-                    f"Client ID collision detected for stream {stream_id}, "
-                    f"assigning unique ID: {client_id}"
-                )
+                chunk_timeout = getattr(settings, "LIVE_CHUNK_TIMEOUT_SECONDS", 15.0)
+                data_elapsed = (
+                    datetime.now(timezone.utc) - existing.last_data_time
+                ).total_seconds()
+                if data_elapsed > chunk_timeout:
+                    # Zombie connection — evict it so this new request cleanly
+                    # takes over the same client record.
+                    logger.info(
+                        f"Evicting zombie connection for client {client_id} "
+                        f"(no data for {data_elapsed:.1f}s, chunk_timeout={chunk_timeout}s) "
+                        f"on stream {stream_id}"
+                    )
+                    await stream_manager.cleanup_client(client_id)
+                else:
+                    # Genuinely active — a different device is likely sharing
+                    # the same IP/UA hash.  Fork to a unique ID so the two
+                    # connections stay independent.
+                    unique_suffix = uuid.uuid4().hex[:8]
+                    client_id = f"client_{client_hash}_{unique_suffix}"
+                    logger.info(
+                        f"Client ID collision detected for stream {stream_id}, "
+                        f"assigning unique ID: {client_id}"
+                    )
 
         # Only register client if not already registered for this stream
         if (
@@ -1474,9 +1535,16 @@ async def get_direct_stream(
 
             # For transcoded streams outputting to pipe:1 or other non-HLS formats,
             # use streamed transcoding path
-            return await stream_manager.stream_transcoded(
+            response = await stream_manager.stream_transcoded(
                 stream_id, client_id, range_header=range_header
             )
+
+            # Start ASGI disconnect monitor so the generator exits promptly
+            # when the client disconnects.  GeneratorExit is not reliably
+            # delivered with uvloop, so we poll the ASGI receive channel.
+            _start_disconnect_monitor(request, client_id, stream_manager)
+
+            return response
         else:
             # Use direct proxy for continuous streams
             # This provides true byte-for-byte proxying with per-client connections
@@ -2280,6 +2348,160 @@ async def trigger_failover(stream_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/validate-cookies-file", dependencies=[Depends(verify_token)])
+async def validate_cookies_file(
+    path: str = Query(
+        ..., description="Absolute path to the cookies file on the proxy host"
+    ),
+):
+    """Check that a cookies file path exists and is readable on the proxy host.
+
+    Used by the editor to verify a user-supplied path before saving the stream profile.
+    Returns a JSON object with `valid` (bool) and `message` (str).
+    """
+    if not path or not path.strip():
+        return {"valid": False, "message": "Path is empty."}
+
+    try:
+        if not os.path.isfile(path):
+            return {"valid": False, "message": f"File not found: {path}"}
+        if not os.access(path, os.R_OK):
+            return {"valid": False, "message": f"File is not readable: {path}"}
+        return {"valid": True, "message": "File exists and is readable."}
+    except Exception as e:
+        logger.warning(f"cookies file validation error for path {path!r}: {e}")
+        return {"valid": False, "message": "Unexpected error validating path"}
+
+
+class YtDlpMetadataRequest(BaseModel):
+    """Request body for the /ytdlp/metadata endpoint."""
+
+    url: str
+    cookies_path: Optional[str] = (
+        None  # Absolute path to a Netscape-format cookies.txt file on the proxy host
+    )
+    # yt-dlp format selector (e.g. 'best', 'bestvideo+bestaudio/best')
+    format: Optional[str] = None
+    # Use --flat-playlist (returns list of entries instead of single JSON)
+    flat_playlist: bool = False
+
+    @field_validator("url")
+    @classmethod
+    def validate_url_field(cls, v):
+        return validate_url(v)
+
+    @field_validator("cookies_path")
+    @classmethod
+    def validate_cookies_path_field(cls, v):
+        if v is not None:
+            v = v.strip()
+            if not v:
+                return None
+            if not os.path.isabs(v):
+                raise ValueError("cookies_path must be an absolute path")
+        return v
+
+
+@app.post("/ytdlp/metadata", dependencies=[Depends(verify_token)])
+async def ytdlp_metadata(request: YtDlpMetadataRequest):
+    """
+    Run yt-dlp on a URL and return the metadata JSON.
+
+    When `flat_playlist=true`, runs with --flat-playlist and returns
+    `{"entries": [...]}` (one object per playlist entry).
+    Otherwise returns the single JSON object for the URL.
+
+    Primarily used by the YouTubearr plugin to check live-stream status
+    and fetch channel/video metadata without requiring yt-dlp to be
+    installed on the editor host.
+    """
+    if not settings.YTDLP_ENABLED:
+        raise HTTPException(
+            status_code=400,
+            detail="yt-dlp resolver is disabled (YTDLP_ENABLED=false)",
+        )
+
+    if not get_resolver_version("yt-dlp"):
+        raise HTTPException(
+            status_code=503,
+            detail="yt-dlp is not installed or not accessible on this proxy host",
+        )
+
+    cookies_path = request.cookies_path
+    if cookies_path:
+        if not os.path.isfile(cookies_path):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cookies file not found on proxy host: {cookies_path}",
+            )
+        if not os.access(cookies_path, os.R_OK):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cookies file is not readable on proxy host: {cookies_path}",
+            )
+
+    cmd = ["yt-dlp", "--dump-json", "--no-download", "--no-warnings"]
+
+    if request.flat_playlist:
+        cmd.append("--flat-playlist")
+
+    if request.format:
+        cmd.extend(["--format", request.format])
+
+    if cookies_path:
+        cmd.extend(["--cookies", cookies_path])
+
+    cmd.append(request.url)
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60.0)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            raise HTTPException(status_code=504, detail="yt-dlp timed out")
+
+        stdout_text = stdout.decode("utf-8", errors="replace").strip()
+        stderr_text = stderr.decode("utf-8", errors="replace").strip()
+
+        if proc.returncode != 0 or not stdout_text:
+            raise HTTPException(
+                status_code=422,
+                detail=f"yt-dlp exited with code {proc.returncode}: {stderr_text[:500]}",
+            )
+
+        if request.flat_playlist:
+            entries = []
+            for line in stdout_text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+            return {"entries": entries}
+
+        try:
+            return json.loads(stdout_text)
+        except json.JSONDecodeError:
+            raise HTTPException(
+                status_code=422,
+                detail="Failed to parse yt-dlp output as JSON",
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"yt-dlp metadata error for {request.url!r}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/health", dependencies=[Depends(verify_token)])
 async def health_check():
     """Health check endpoint with detailed status"""
@@ -2361,8 +2583,7 @@ async def test_url_connectivity(request: TestConnectionRequest):
         logger.error(f"Error testing URL {test_url}: {e}")
         return {
             "success": False,
-            "message": f"Error testing connection: {str(e)}",
-            "error": str(e),
+            "message": "An unexpected error occurred while testing the connection",
             "url_tested": test_url,
         }
 

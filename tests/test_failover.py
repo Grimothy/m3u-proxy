@@ -452,7 +452,10 @@ class TestFFmpegErrorPatterns:
     """Test FFmpeg stderr error pattern detection"""
 
     def test_input_error_patterns(self):
-        """Test that SharedTranscodingProcess detects input errors"""
+        """Test that SharedTranscodingProcess detects input errors via the
+        module-level pattern tuple."""
+        from pooled_stream_manager import _FFMPEG_INPUT_ERROR_PATTERNS
+
         # These are the error patterns we should detect
         error_patterns = [
             "Error opening input file https://example.com/stream.m3u8",
@@ -465,21 +468,20 @@ class TestFFmpegErrorPatterns:
             "Protocol not found",
         ]
 
-        # Verify each pattern would be caught
         for error_msg in error_patterns:
             assert any(
-                pattern in error_msg.lower()
-                for pattern in [
-                    "error opening input",
-                    "failed to resolve hostname",
-                    "connection refused",
-                    "connection timed out",
-                    "server returned 4",
-                    "server returned 5",
-                    "invalid data found",
-                    "protocol not found",
-                ]
-            )
+                pattern in error_msg.lower() for pattern in _FFMPEG_INPUT_ERROR_PATTERNS
+            ), f"Expected to match an input error pattern: {error_msg}"
+
+    def test_input_error_patterns_excludes_bare_end_of_file(self):
+        """Regression: ffmpeg 8.1 prints 'Error reading HTTP response: End of file'
+        on every HLS segment fetch end while -reconnect 1 silently reconnects,
+        so 'end of file' must not be a failover trigger on its own. Real upstream
+        loss is caught by the more specific patterns + the data-starvation
+        detector in stream_manager."""
+        from pooled_stream_manager import _FFMPEG_INPUT_ERROR_PATTERNS
+
+        assert "end of file" not in _FFMPEG_INPUT_ERROR_PATTERNS
 
     @pytest.mark.asyncio
     async def test_stderr_monitor_detects_input_error(self):
@@ -510,6 +512,34 @@ class TestFFmpegErrorPatterns:
 
         # Should have marked the stream as input_failed
         assert process.status == "input_failed"
+
+    @pytest.mark.asyncio
+    async def test_stderr_monitor_ignores_segment_end_eof(self):
+        """Regression for ffmpeg 8.1: a normal HLS segment-fetch EOF must NOT
+        flip status to input_failed. ffmpeg 8.1 logs this on every segment end
+        and recovers via -reconnect 1, so it isn't a failure."""
+        process = SharedTranscodingProcess(
+            stream_id="test_stream_eof",
+            url="http://example.com/stream.m3u8",
+            profile="test",
+            ffmpeg_args=["-i", "{input_url}", "-c", "copy", "pipe:1"],
+            user_agent="test-agent",
+        )
+
+        mock_process = Mock()
+        mock_stderr = AsyncMock()
+
+        eof_line = b"[http @ 0x7f202400c740] Error reading HTTP response: End of file\n"
+        mock_stderr.read = AsyncMock(side_effect=[eof_line, b""])
+
+        mock_process.stderr = mock_stderr
+        mock_process.returncode = None
+        process.process = mock_process
+
+        await process._log_stderr()
+
+        # Status must remain "starting" (init default), not flip to input_failed.
+        assert process.status != "input_failed"
 
 
 class TestFailoverStats:
@@ -631,6 +661,227 @@ class TestFailoverIntegration:
         # Note: The event might already be cleared due to the sleep in the method
         # So we just check that failover happened
         assert stream_info.current_url == failover_url
+
+
+class TestManualFailoverRegression:
+    """Regression tests for manual failover triggered from the Stream Monitor.
+
+    Covers the two bugs from issue #1180:
+    1. Transcoded streams: FFmpeg is killed (queuing None) before the generator can check
+       failover_event in the normal place, so the generator disconnected the client instead
+       of reconnecting to the failover URL.
+    2. Direct (live TS) streams, resolver mode: after the inner loop broke due to
+       failover_event, the post-inner-loop code called _try_update_failover_url a second
+       time, double-advancing to URL #3 instead of reconnecting to the intended URL #2.
+    """
+
+    @pytest_asyncio.fixture
+    async def stream_manager(self):
+        manager = StreamManager()
+        manager.pooled_manager = Mock(spec=PooledStreamManager)
+        yield manager
+        if hasattr(manager, "_running"):
+            manager._running = False
+
+    @pytest.mark.asyncio
+    async def test_transcoded_failover_stays_connected_on_queue_none(
+        self, stream_manager, monkeypatch
+    ):
+        """Regression #1180 (transcoded path): when _try_update_failover_url kills the
+        FFmpeg process (sending None to the client queue) while failover_event is set,
+        the generator must stay connected and serve data from the failover stream rather
+        than disconnecting the client."""
+        primary_url = "http://primary.example.com/stream.m3u8"
+        failover_url = "http://backup.example.com/stream.m3u8"
+        client_id = "test_client"
+
+        stream_id = await stream_manager.get_or_create_stream(
+            primary_url,
+            failover_resolver_url="http://resolver.example.com/failover",
+            is_transcoded=True,
+            transcode_profile="custom",
+            transcode_ffmpeg_args=["-i", "{input_url}", "-f", "mpegts", "pipe:1"],
+        )
+        stream_info = stream_manager.streams[stream_id]
+
+        # Queue 1 (original stream): starts empty — None is injected externally once
+        # the generator is already reading from it, mimicking _try_update_failover_url
+        # killing FFmpeg mid-stream.  We use an instrumented queue so the test can
+        # coordinate precisely: set failover_event and inject None only AFTER the
+        # generator has started its q1.get() call (i.e. after the outer loop's
+        # failover_event.clear() has already run).
+        class _SignallingQueue:
+            """Wraps asyncio.Queue, setting an asyncio.Event on the first get() call."""
+
+            def __init__(self):
+                self._q = asyncio.Queue()
+                self.first_get = asyncio.Event()
+
+            async def get(self):
+                self.first_get.set()
+                return await self._q.get()
+
+            def empty(self):
+                return self._q.empty()
+
+        q1 = _SignallingQueue()
+
+        # Queue 2 (failover stream): delivers one real chunk then ends naturally.
+        q2 = asyncio.Queue()
+        await q2.put(b"failover_data")
+        await q2.put(None)
+
+        def _make_process(queue):
+            p = Mock()
+            p.status = "running"
+            p.process = Mock()
+            p.process.pid = 1000
+            p.process.returncode = None
+            p.process.stdout = Mock()
+            p.client_queues = {client_id: queue}
+            return p
+
+        stream_manager.pooled_manager.get_or_create_shared_stream = AsyncMock(
+            side_effect=[
+                ("key1", _make_process(q1)),
+                ("key2", _make_process(q2)),
+            ]
+        )
+        stream_manager.pooled_manager.remove_client_from_stream = AsyncMock()
+        stream_manager.pooled_manager.force_stop_stream = AsyncMock()
+        stream_manager.pooled_manager.update_client_activity = Mock()
+
+        # Skip the 2-second FFmpeg startup polling loop for test speed.
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock(return_value=None))
+
+        chunks = []
+
+        async def consume():
+            resp = await stream_manager.stream_transcoded(stream_id, client_id)
+            async for chunk in resp.body_iterator:
+                chunks.append(chunk)
+
+        consume_task = asyncio.create_task(consume())
+
+        # Wait until the generator has started its first q1.get() — the outer loop's
+        # failover_event.clear() has already executed by this point, so setting the
+        # event here won't be wiped by that safety clear.
+        await q1.first_get.wait()
+
+        # Simulate _try_update_failover_url: update URL, fire event, kill FFmpeg.
+        stream_info.current_url = failover_url
+        stream_info.failover_event.set()
+        await q1._q.put(None)
+
+        await consume_task
+
+        assert b"failover_data" in chunks, (
+            "Generator should have served data from the failover stream"
+        )
+        assert (
+            stream_manager.pooled_manager.get_or_create_shared_stream.call_count == 2
+        ), (
+            "Generator must reconnect (call get_or_create_shared_stream twice) "
+            "rather than disconnecting the client"
+        )
+
+    @pytest.mark.asyncio
+    async def test_direct_stream_no_double_advance_after_failover_event(
+        self, stream_manager, monkeypatch
+    ):
+        """Regression #1180 (direct stream, resolver mode): after the inner loop breaks
+        due to failover_event, the generator must reconnect to the already-set failover URL
+        without calling _try_update_failover_url again.  Calling it would double-advance
+        to URL #3 instead of URL #2 (the intended manual-failover target)."""
+        primary_url = "http://primary.example.com/stream.ts"
+        failover_url = "http://backup.example.com/stream.ts"
+
+        stream_id = await stream_manager.get_or_create_stream(
+            primary_url,
+            failover_resolver_url="http://resolver.example.com/failover",
+        )
+        stream_info = stream_manager.streams[stream_id]
+
+        # Simulate _try_update_failover_url having already run externally:
+        # current_url = failover URL, event is set, attempt counter updated.
+        stream_info.current_url = failover_url
+        stream_info.failover_event.set()
+        stream_info.failover_attempts = 1
+        stream_info.current_failover_index = 0
+
+        called_urls = []
+        call_number = [0]
+
+        async def _fake_stream(method, url, **kwargs):
+            called_urls.append(url)
+            call_number[0] += 1
+
+            # On the second connection: disable resolver so the natural stream-end
+            # path exits cleanly (has_failover=False, chunks < min_chunks threshold).
+            if call_number[0] >= 2:
+                stream_info.failover_resolver_url = None
+                stream_info.failover_urls = []
+
+            class _Iter:
+                def __init__(self, chunks):
+                    self._chunks = list(chunks)
+                    self._idx = 0
+
+                def __aiter__(self):
+                    return self
+
+                async def __anext__(self):
+                    if self._idx >= len(self._chunks):
+                        raise StopAsyncIteration
+                    c = self._chunks[self._idx]
+                    self._idx += 1
+                    return c
+
+            class _Resp:
+                status_code = 200
+                headers = {"content-type": "video/mp2t"}
+
+                def raise_for_status(self):
+                    pass
+
+                def aiter_bytes(self, chunk_size=32768):
+                    # First connection: no chunks (inner loop detects failover_event immediately).
+                    # Second connection: one chunk (< LIVE_SILENT_RECONNECT_MIN_CHUNKS=10 → natural exit).
+                    data = [] if call_number[0] == 1 else [b"failover_data"]
+                    return _Iter(data)
+
+            class _CM:
+                async def __aenter__(self):
+                    return _Resp()
+
+                async def __aexit__(self, *args):
+                    return False
+
+            return _CM()
+
+        monkeypatch.setattr(stream_manager.live_stream_client, "stream", _fake_stream)
+
+        response = await stream_manager.stream_continuous_direct(
+            stream_id, "test_client"
+        )
+        chunks = []
+        async for chunk in response.body_iterator:
+            chunks.append(chunk)
+
+        assert len(called_urls) >= 2, (
+            f"Expected at least 2 upstream connections, got: {called_urls}"
+        )
+        assert called_urls[0] == failover_url, (
+            "First connection should be to the already-set failover URL"
+        )
+        assert called_urls[1] == failover_url, (
+            "Second connection must ALSO be the failover URL — "
+            "_try_update_failover_url must not be called again after the "
+            "failover_event break (that would double-advance to URL #3)"
+        )
+        assert b"failover_data" in chunks, (
+            "Generator should have served data from the second (failover) connection"
+        )
 
 
 if __name__ == "__main__":

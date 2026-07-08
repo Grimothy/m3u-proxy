@@ -13,6 +13,9 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
+# Install Deno (default JS runtime for yt-dlp's EJS challenge solver — no extra flags needed)
+COPY --from=denoland/deno:latest /usr/bin/deno /usr/local/bin/deno
+
 # Create symlink for python command
 RUN ln -s /usr/bin/python3 /usr/bin/python
 

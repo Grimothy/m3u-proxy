@@ -5,6 +5,7 @@ Implements connection pooling and multi-worker coordination.
 
 import asyncio
 import json
+import re
 import time
 import uuid
 import hashlib
@@ -13,6 +14,78 @@ import logging
 from config import settings
 import os
 import tempfile
+
+# Live ffmpeg progress fields written to stderr (e.g.
+# "frame=  243 fps= 30 q=28.0 size=    1152kB time=00:00:08.13 bitrate=1162.5kbits/s speed=1.01x")
+_FFMPEG_PROGRESS_FIELD_RE = re.compile(
+    r"\b(?P<key>frame|fps|bitrate|speed|q|size|time)\s*=\s*(?P<val>\S+)"
+)
+
+# "Input #0, mpegts, from 'http://...':" or
+# "Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'file.mp4':" — captures the comma-
+# separated container synonyms list (split into the canonical name later).
+_FFMPEG_INPUT_LINE_RE = re.compile(
+    r"^\s*Input #\d+,\s*(?P<container>[\w,]+),\s*from\s+"
+)
+
+# "Output #0, mpegts, to 'pipe:1':" or "Output #0, hls, to '/path/index.m3u8':".
+# Once this line is emitted by ffmpeg, every subsequent Stream # line refers to
+# the encoder/muxer output rather than the source input.
+_FFMPEG_OUTPUT_LINE_RE = re.compile(
+    r"^\s*Output #\d+,\s*(?P<container>[\w,]+),\s*to\s+"
+)
+
+# "Stream #0:0[0x100]: Video: h264 (Main) ([27][0][0][0] / 0x001B), yuv420p..."
+# "Stream #0:0[0x100][0x200]: Video: hevc ..." (dual PID bracket groups in MPEG-TS)
+# "Stream #0:1[0x101](eng): Audio: aac (LC) ..."
+_FFMPEG_STREAM_LINE_RE = re.compile(
+    r"Stream #\d+:\d+(?:\[[^\]]+\])*(?:\([^)]+\))?:\s+"
+    r"(?P<type>Video|Audio):\s+(?P<details>.+)$"
+)
+
+# Audio channel layout: "stereo", "mono", "5.1", "5.1(side)", "5.1(back)", "7.1", "quad", etc.
+# The (?:\([^)]*\))? tolerates the variant suffixes ffmpeg appends to 5.1/7.1.
+_AUDIO_LAYOUT_RE = re.compile(
+    r",\s*(?P<layout>stereo|mono|5\.1|7\.1|quad)(?:\([^)]*\))?[,\s]"
+)
+
+# "1280x720" or "1920x1080 [SAR 1:1 DAR 16:9]" inside a Stream line.
+_RESOLUTION_RE = re.compile(r"\b(?P<w>\d{2,5})x(?P<h>\d{2,5})\b")
+
+# stderr substrings (case-insensitive match) that signal ffmpeg has been told
+# to write somewhere it can't. These mark the stream as failed for cleanup.
+_FFMPEG_WRITE_ERROR_PATTERNS = (
+    "no space left on device",
+    "permission denied",
+    "i/o error",
+    "disk full",
+    "cannot write",
+    "failed to open",
+    "error writing",
+)
+
+# stderr substrings (case-insensitive match) that signal a genuine upstream
+# input failure and should trip failover. We deliberately do NOT include the
+# bare "end of file" string: ffmpeg 8.1 writes "Error reading HTTP response:
+# End of file" on every HLS segment fetch end (the HTTP layer closes when the
+# segment body is exhausted) and immediately reconnects via -reconnect 1, so
+# that line is normal traffic — not a stream failure. Genuine upstream loss
+# is still caught by:
+#   * the more specific patterns below ("connection refused", "server returned
+#     4xx/5xx", "error opening input", etc. — emitted when reconnect fails)
+#   * the low-bitrate / silence detectors in stream_manager.py, which trigger
+#     on actual data starvation regardless of what stderr says.
+_FFMPEG_INPUT_ERROR_PATTERNS = (
+    "error opening input",
+    "failed to resolve hostname",
+    "connection refused",
+    "connection timed out",
+    "input/output error",
+    "server returned 4",  # Matches 403, 404, etc.
+    "server returned 5",  # Matches 500, 502, 503, etc.
+    "invalid data found",
+    "protocol not found",
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +113,7 @@ class SharedTranscodingProcess:
         hls_base_dir: Optional[str] = None,
         resolver_type: Optional[str] = None,
         resolver_args: Optional[str] = None,
-        resolver_cookies: Optional[str] = None,
+        resolver_cookies_path: Optional[str] = None,
     ):
         self.stream_id = stream_id
         self.url = url
@@ -51,9 +124,8 @@ class SharedTranscodingProcess:
         self.metadata = metadata or {}
         self.resolver_type = resolver_type  # "streamlink" or "ytdlp"
         self.resolver_args = resolver_args  # quality/format string + optional flags
-        self.resolver_cookies = resolver_cookies  # Netscape-format cookies.txt content
-        self._cookies_path: Optional[str] = (
-            None  # temp file path, cleaned up in cleanup()
+        self.resolver_cookies_path = (
+            resolver_cookies_path  # path to cookies.txt on proxy host
         )
         # Base directory to create HLS per-stream directories in. If None,
         # the process will fall back to the system tempdir.
@@ -64,6 +136,23 @@ class SharedTranscodingProcess:
         self.last_access = time.time()
         self.total_bytes_served = 0
         self.status = "starting"
+        # Live media info parsed from the active ffmpeg process's own stderr —
+        # codec/container/resolution/audio from the "Input #" and "Stream #"
+        # lines printed at startup, plus live bitrate/fps from the periodic
+        # progress line. We do NOT run a separate ffprobe against the source
+        # because that would double the upstream connection count and IPTV
+        # providers reject the second connection. Empty for resolver streams
+        # (streamlink/yt-dlp) that don't go through ffmpeg.
+        self.media_info: Dict[str, Any] = {}
+        # Output-side counterpart describing what ffmpeg is producing right now
+        # (encoder codec / target resolution / muxer container) plus the live
+        # progress fields, which are technically output stats. Populated only
+        # after ffmpeg prints its "Output #" line, so it stays empty for plain
+        # passthrough where no ffmpeg process is involved.
+        self.output_media_info: Dict[str, Any] = {}
+        # Parser state: flips True once "Output #" is seen in stderr so the
+        # Stream-line parser knows where to route subsequent codec lines.
+        self._parsing_output: bool = False
 
         # Broadcasting support - each client gets its own queue
         self.client_queues: Dict[str, asyncio.Queue] = {}
@@ -159,28 +248,16 @@ class SharedTranscodingProcess:
             else:
                 cmd = ["yt-dlp", self.url] + extra + ["-o", "-"]
 
-        # Write cookies to a temp file if provided — both yt-dlp and streamlink
-        # accept --cookies <path> for Netscape-format cookie files.
-        # Path stored on self so cleanup() can remove it when the stream ends.
-        if self.resolver_cookies and self.resolver_cookies.strip():
-            try:
-                tmp = tempfile.NamedTemporaryFile(
-                    mode="w",
-                    suffix=".txt",
-                    delete=False,
-                    prefix="m3uproxy_cookies_",
-                )
-                tmp.write(self.resolver_cookies.strip() + "\n")
-                tmp.flush()
-                tmp.close()
-                self._cookies_path = tmp.name
-                cmd.extend(["--cookies", self._cookies_path])
+        if self.resolver_cookies_path and self.resolver_cookies_path.strip():
+            cookies_path = self.resolver_cookies_path.strip()
+            if os.path.isfile(cookies_path) and os.access(cookies_path, os.R_OK):
+                cmd.extend(["--cookies", cookies_path])
                 logger.info(
-                    f"Using cookies file for {resolver_binary} stream {self.stream_id}"
+                    f"Using cookies file for {resolver_binary} stream {self.stream_id}: {cookies_path}"
                 )
-            except Exception as e:
+            else:
                 logger.warning(
-                    f"Failed to write cookies temp file for stream {self.stream_id}: {e}"
+                    f"Cookies file not found or not readable for stream {self.stream_id}: {cookies_path!r} — skipping"
                 )
 
         logger.info(
@@ -360,7 +437,8 @@ class SharedTranscodingProcess:
             self.status = "running"
             logger.info(f"Shared FFmpeg process started with PID: {self.process.pid}")
 
-            # Start stderr logging task
+            # Start stderr logging task — also parses codec/resolution/bitrate
+            # from ffmpeg's own output (no extra upstream connections).
             asyncio.create_task(self._log_stderr())
 
             # Start broadcaster task to read from FFmpeg and send to all clients
@@ -465,37 +543,122 @@ class SharedTranscodingProcess:
         except Exception as e:
             logger.debug(f"HLS watch loop ended for {self.stream_id}: {e}")
 
+    def _parse_ffmpeg_input_line(self, line_str: str) -> None:
+        """
+        Parse ffmpeg's "Input #0, FORMAT, from 'URL':" line for the container
+        format. ffmpeg prints this once per input when it opens the stream.
+        """
+        match = _FFMPEG_INPUT_LINE_RE.match(line_str)
+        if not match:
+            return
+        container = match.group("container").strip().split(",")[0].strip()
+        if container and "container" not in self.media_info:
+            self.media_info["container"] = container.upper()
+
+    def _parse_ffmpeg_output_line(self, line_str: str) -> None:
+        """
+        Parse ffmpeg's "Output #0, FORMAT, to 'TARGET':" line. Captures the
+        muxer container into output_media_info and flips the parser state so
+        that subsequent Stream # lines are recognised as output streams. Only
+        the first Output block is honoured — multi-output configs (e.g. tee)
+        would each restate the marker but we keep the first match.
+        """
+        match = _FFMPEG_OUTPUT_LINE_RE.match(line_str)
+        if not match:
+            return
+        self._parsing_output = True
+        container = match.group("container").strip().split(",")[0].strip()
+        if container and "container" not in self.output_media_info:
+            self.output_media_info["container"] = container.upper()
+
+    def _parse_ffmpeg_stream_line(self, line_str: str) -> None:
+        """
+        Parse ffmpeg's "Stream #0:N[...]: Video|Audio: ..." lines for codec
+        details. ffmpeg prints one per stream right after the input is opened
+        — this is free metadata that doesn't require a second connection.
+        Routes into media_info or output_media_info based on whether the
+        "Output #" marker has been seen yet.
+        """
+        match = _FFMPEG_STREAM_LINE_RE.search(line_str)
+        if not match:
+            return
+        target = self.output_media_info if self._parsing_output else self.media_info
+        stream_type = match.group("type").lower()
+        details = match.group("details")
+        if stream_type == "video":
+            # Codec name is the first token, may be followed by a parenthesised
+            # profile (e.g. "h264 (Main) (HEVC / 0x...)" — strip parens).
+            codec = details.split(",", 1)[0].strip()
+            codec = re.sub(r"\s*\(.*", "", codec).strip()
+            if codec and "video_codec" not in target:
+                target["video_codec"] = codec
+            res_match = _RESOLUTION_RE.search(details)
+            if res_match and "resolution" not in target:
+                target["resolution"] = f"{res_match.group('w')}x{res_match.group('h')}"
+        elif stream_type == "audio":
+            codec = details.split(",", 1)[0].strip()
+            codec = re.sub(r"\s*\(.*", "", codec).strip()
+            if codec and "audio_codec" not in target:
+                target["audio_codec"] = codec
+            layout_match = _AUDIO_LAYOUT_RE.search(details)
+            if layout_match and "audio_channels" not in target:
+                target["audio_channels"] = layout_match.group("layout")
+
+    def _parse_ffmpeg_progress(self, line_str: str) -> None:
+        """
+        Extract live progress fields (bitrate, fps, frame, speed) from a single
+        ffmpeg stderr line. Progress numbers describe the encoder output, so
+        once the "Output #" marker has been seen we mirror them into
+        output_media_info. We also keep writing them to media_info so existing
+        callers (Stream Info badge row in m3u-editor PR #1089) don't regress.
+        No-op for non-progress lines.
+        """
+        # Cheap pre-filter — most stderr lines aren't progress
+        if "bitrate=" not in line_str and "fps=" not in line_str:
+            return
+        targets = [self.media_info]
+        if self._parsing_output:
+            targets.append(self.output_media_info)
+        for match in _FFMPEG_PROGRESS_FIELD_RE.finditer(line_str):
+            key = match.group("key")
+            raw = match.group("val")
+            if key == "bitrate":
+                if raw.endswith("kbits/s"):
+                    try:
+                        value = round(float(raw[:-7]), 1)
+                    except ValueError:
+                        continue
+                    for t in targets:
+                        t["bitrate_kbps"] = value
+            elif key == "fps":
+                try:
+                    value = round(float(raw), 2)
+                except ValueError:
+                    continue
+                for t in targets:
+                    t["fps"] = value
+            elif key == "frame":
+                try:
+                    value = int(raw)
+                except ValueError:
+                    continue
+                for t in targets:
+                    t["frame"] = value
+            elif key == "speed":
+                if raw.endswith("x"):
+                    try:
+                        value = round(float(raw[:-1]), 2)
+                    except ValueError:
+                        continue
+                    for t in targets:
+                        t["speed"] = value
+
     async def _log_stderr(self):
         """Log FFmpeg stderr output and monitor for write errors and input failures"""
         if not self.process or not self.process.stderr:
             return
 
         try:
-            # Monitor FFmpeg stderr for various error conditions
-            write_error_patterns = [
-                "no space left on device",
-                "permission denied",
-                "i/o error",
-                "disk full",
-                "cannot write",
-                "failed to open",
-                "error writing",
-            ]
-
-            # Input/connection error patterns that should trigger failover
-            input_error_patterns = [
-                "error opening input",
-                "failed to resolve hostname",
-                "connection refused",
-                "connection timed out",
-                "input/output error",
-                "server returned 4",  # Matches 403, 404, etc.
-                "server returned 5",  # Matches 500, 502, 503, etc.
-                "invalid data found",
-                "protocol not found",
-                "end of file",
-            ]
-
             # Read stderr in small chunks and buffer lines ourselves to avoid
             # asyncio.StreamReader's LimitOverrunError when ffmpeg writes very
             # long lines without a newline (which results in the message
@@ -515,20 +678,44 @@ class SharedTranscodingProcess:
 
                 buf += chunk
 
-                # Split on newline and process full lines
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
+                # Split on \n OR \r — ffmpeg writes its periodic stats line with
+                # a trailing \r so it overwrites in-place in a terminal. Without
+                # splitting on \r those stats lines are buffered until the next
+                # newline arrives and we miss the live bitrate/fps updates.
+                while True:
+                    n_idx = buf.find(b"\n")
+                    r_idx = buf.find(b"\r")
+                    if n_idx == -1 and r_idx == -1:
+                        break
+                    if n_idx == -1:
+                        idx = r_idx
+                    elif r_idx == -1:
+                        idx = n_idx
+                    else:
+                        idx = min(n_idx, r_idx)
+                    line, buf = buf[:idx], buf[idx + 1 :]
                     line_str = line.decode("utf-8", errors="ignore").strip()
                     if not line_str:
                         continue
 
-                    # Log FFmpeg output (you could parse stats here)
-                    logger.debug(f"FFmpeg [{self.stream_id}]: {line_str}")
+                    # Skip debug logging for periodic progress lines (~2/s per stream) —
+                    # they're already captured into media_info and add no diagnostic value.
+                    if "bitrate=" not in line_str and "fps=" not in line_str:
+                        logger.debug(f"FFmpeg [{self.stream_id}]: {line_str}")
+                    # Skip parsers for resolver (yt-dlp/streamlink) stderr — their
+                    # output format is not ffmpeg's, so the regexes won't match but
+                    # a coincidental "fps=" or "bitrate=" in debug output could
+                    # populate stale values.
+                    if not self.resolver_type:
+                        self._parse_ffmpeg_input_line(line_str)
+                        self._parse_ffmpeg_output_line(line_str)
+                        self._parse_ffmpeg_stream_line(line_str)
+                        self._parse_ffmpeg_progress(line_str)
 
                     line_lower = line_str.lower()
 
                     # Check for write errors
-                    for pattern in write_error_patterns:
+                    for pattern in _FFMPEG_WRITE_ERROR_PATTERNS:
                         if pattern in line_lower:
                             logger.error(
                                 f"FFmpeg write error detected for {self.stream_id}: {line_str}"
@@ -538,7 +725,7 @@ class SharedTranscodingProcess:
                             break
 
                     # Check for input/connection errors that should trigger failover
-                    for pattern in input_error_patterns:
+                    for pattern in _FFMPEG_INPUT_ERROR_PATTERNS:
                         if pattern in line_lower:
                             logger.error(
                                 f"FFmpeg input error detected for {self.stream_id}: {line_str}"
@@ -601,8 +788,13 @@ class SharedTranscodingProcess:
                     f"Client {client_id} left shared stream {self.stream_id} ({len(self.clients)} remaining)"
                 )
 
-            # Remove client's queue
+            # Remove client's queue, sending None sentinel first so the
+            # streaming generator exits its wait loop promptly.
             if client_id in self.client_queues:
+                try:
+                    self.client_queues[client_id].put_nowait(None)
+                except Exception:
+                    pass
                 del self.client_queues[client_id]
 
     async def prune_stale_clients(self, timeout: int):
@@ -672,7 +864,6 @@ class SharedTranscodingProcess:
         finally:
             # Always attempt HLS cleanup in finally block to ensure it runs even if FFmpeg cleanup fails
             await self._cleanup_hls_directory()
-            self._cleanup_cookies_file()
 
     async def _cleanup_hls_directory(self):
         """Clean up HLS directory and all segments"""
@@ -714,16 +905,6 @@ class SharedTranscodingProcess:
 
         except Exception as e:
             logger.error(f"Error cleaning up HLS directory for {self.stream_id}: {e}")
-
-    def _cleanup_cookies_file(self) -> None:
-        """Remove the temporary cookies file created for this resolver stream."""
-        if self._cookies_path:
-            try:
-                os.unlink(self._cookies_path)
-            except OSError:
-                pass
-            finally:
-                self._cookies_path = None
 
 
 class PooledStreamManager:
@@ -1154,7 +1335,7 @@ class PooledStreamManager:
         reuse_stream_key: Optional[str] = None,
         resolver_type: Optional[str] = None,
         resolver_args: Optional[str] = None,
-        resolver_cookies: Optional[str] = None,
+        resolver_cookies_path: Optional[str] = None,
     ) -> Tuple[str, SharedTranscodingProcess]:
         """Get existing shared stream or create new one
 
@@ -1232,7 +1413,7 @@ class PooledStreamManager:
             hls_base_dir=self.hls_base_dir,
             resolver_type=resolver_type,
             resolver_args=resolver_args,
-            resolver_cookies=resolver_cookies,
+            resolver_cookies_path=resolver_cookies_path,
         )
 
         if await process.start_process():
@@ -1317,16 +1498,21 @@ class PooledStreamManager:
     async def force_stop_stream(self, stream_key: str):
         """
         Immediately stop a stream and its FFmpeg process without grace period.
-        Used when explicitly deleting a stream via API.
+        Used when explicitly deleting a stream via API and during failover.
+
+        Pops the entry up front and cleans up the captured reference so a
+        concurrent get_or_create_shared_stream that re-inserts at the same key
+        (e.g. a failover client racing this teardown) isn't torn down by the
+        trailing cleanup.
         """
-        if stream_key not in self.shared_processes:
+        process = self.shared_processes.pop(stream_key, None)
+        if process is None:
             logger.info(f"Stream {stream_key} not found in local processes")
             return False
 
         logger.info(
             f"Force stopping stream {stream_key} and terminating FFmpeg process"
         )
-        process = self.shared_processes[stream_key]
 
         # Remove all clients from this stream immediately
         clients_to_remove = list(process.clients.keys())
@@ -1335,8 +1521,24 @@ class PooledStreamManager:
             if client_id in self.client_streams:
                 del self.client_streams[client_id]
 
-        # Immediately cleanup the FFmpeg process
-        await self._cleanup_local_process(stream_key)
+        # Tear down the captured process — NOT whatever is at stream_key now.
+        await process.cleanup()
+
+        # Mirror the auxiliary cleanup that _cleanup_local_process does so the
+        # state stays consistent regardless of which path called us.
+        if stream_key in self.stream_key_to_id:
+            del self.stream_key_to_id[stream_key]
+        if self.redis_client:
+            try:
+                redis_key = f"stream:{stream_key}"
+                await self.redis_client.delete(redis_key)
+                await self.redis_client.srem(
+                    f"worker:{self.worker_id}:streams", redis_key
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Error cleaning up Redis state for stream {stream_key}: {e}"
+                )
 
         logger.info(f"Stream {stream_key} force stopped, FFmpeg process terminated")
         return True

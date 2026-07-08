@@ -96,7 +96,9 @@ class StreamInfo:
     # Resolver backend (streamlink / ytdlp) - when set, bypasses FFmpeg
     resolver_type: Optional[str] = None
     resolver_args: Optional[str] = None
-    resolver_cookies: Optional[str] = None  # Netscape-format cookies.txt content
+    resolver_cookies_path: Optional[str] = (
+        None  # Absolute path to Netscape-format cookies.txt on proxy host
+    )
     # Strict Live TS Mode - improved handling for live MPEG-TS streams
     strict_live_ts: bool = False
     # Circuit breaker - track bad upstream endpoints temporarily
@@ -167,38 +169,76 @@ class M3U8Processor:
                             media.absolute_uri, base_proxy_url
                         )
             else:
+                # Track init_section objects we've already rewritten — the same
+                # Initialization object is shared across all segments that follow
+                # an EXT-X-MAP declaration, so we must rewrite each one only once.
+                seen_init_sections = set()
                 for segment in playlist.segments:
                     segment.uri = self._rewrite_url(
                         segment.absolute_uri, base_proxy_url
                     )
-                # Handle initialization section if present
-                for seg_map in (
+                    init_section = getattr(segment, "init_section", None)
+                    if (
+                        init_section
+                        and getattr(init_section, "uri", None)
+                        and id(init_section) not in seen_init_sections
+                    ):
+                        init_section.uri = self._rewrite_url(
+                            init_section.absolute_uri, base_proxy_url
+                        )
+                        seen_init_sections.add(id(init_section))
+
+                # Handle playlist-level segment_map (some m3u8 lib versions expose
+                # the EXT-X-MAP entries here as a list). Skip objects already
+                # visited via segment.init_section above.
+                segment_maps = (
                     playlist.segment_map
                     if isinstance(playlist.segment_map, list)
-                    else []
-                ):
-                    if hasattr(seg_map, "uri") and seg_map.uri:
+                    else ([playlist.segment_map] if playlist.segment_map else [])
+                )
+                for seg_map in segment_maps:
+                    if (
+                        getattr(seg_map, "uri", None)
+                        and id(seg_map) not in seen_init_sections
+                    ):
                         seg_map.uri = self._rewrite_url(
                             seg_map.absolute_uri, base_proxy_url
                         )
+                        seen_init_sections.add(id(seg_map))
 
             return playlist.dumps()
         except Exception as e:
             logger.error(f"Error processing M3U8 playlist: {e}")
             return content
 
+    @staticmethod
+    def _segment_kind(url: str) -> str:
+        """Classify an HLS segment URL by its file extension.
+
+        Returns the routing extension used in proxy URLs ("ts", "m4s", or "mp4").
+        Defaults to "ts" for unknown extensions to preserve existing behavior.
+        """
+        path = url.split("?", 1)[0].lower()
+        if path.endswith((".m4s", ".cmfv", ".cmfa", ".cmft")):
+            return "m4s"
+        if path.endswith(".mp4"):
+            return "mp4"
+        return "ts"
+
     def _rewrite_url(self, original_url: str, base_proxy_url: str) -> str:
         """Rewrites a URL to point to the proxy, encoding the original URL."""
         encoded_url = quote(original_url, safe="")
         # Check path only — strip query params to handle URLs like *.m3u8?location=ABC123
-        if original_url.split("?")[0].endswith(".m3u8"):
+        path = original_url.split("?", 1)[0].lower()
+        if path.endswith(".m3u8"):
             # For variant playlists, include parent stream ID
             parent_param = (
                 f"&parent={self.parent_stream_id}" if self.parent_stream_id else ""
             )
             return f"{base_proxy_url}/playlist.m3u8?url={encoded_url}&client_id={self.client_id}{parent_param}"
-        else:
-            return f"{base_proxy_url}/segment.ts?url={encoded_url}&client_id={self.client_id}"
+
+        kind = self._segment_kind(original_url)
+        return f"{base_proxy_url}/segment.{kind}?url={encoded_url}&client_id={self.client_id}"
 
 
 class StreamManager:
@@ -505,7 +545,7 @@ class StreamManager:
         transcode_ffmpeg_args: Optional[List[str]] = None,
         resolver_type: Optional[str] = None,
         resolver_args: Optional[str] = None,
-        resolver_cookies: Optional[str] = None,
+        resolver_cookies_path: Optional[str] = None,
         strict_live_ts: Optional[bool] = None,
         use_sticky_session: Optional[bool] = None,
         enable_silence_detection: Optional[bool] = None,
@@ -628,7 +668,7 @@ class StreamManager:
                 transcode_ffmpeg_args=transcode_ffmpeg_args or [],
                 resolver_type=resolver_type,
                 resolver_args=resolver_args,
-                resolver_cookies=resolver_cookies,
+                resolver_cookies_path=resolver_cookies_path,
                 strict_live_ts=strict_live_ts or False,
                 use_sticky_session=effective_use_sticky_session,
                 enable_silence_detection=enable_silence_detection,
@@ -882,6 +922,37 @@ class StreamManager:
     # ============================================================================
     # DIRECT PROXY FOR CONTINUOUS STREAMS (New Architecture)
     # ============================================================================
+
+    @staticmethod
+    def _inject_ts_discontinuity(chunk: bytes) -> bytes:
+        """Set the discontinuity_indicator bit in every TS packet adaptation field found in chunk.
+
+        Called once on the first chunk after a silent reconnect so downstream players
+        (ChannelsDVR, VLC, etc.) know to reinitialise their decoders at the splice point.
+        Only touches packets that already carry an adaptation field with at least one flags
+        byte — no structural changes to packet layout are made.
+        """
+        PACKET_SIZE = 188
+        if len(chunk) < PACKET_SIZE:
+            return chunk
+
+        result = bytearray(chunk)
+        i = 0
+        # Sync to first valid 0x47 sync byte.
+        while i < len(result) - PACKET_SIZE and result[i] != 0x47:
+            i += 1
+
+        while i + PACKET_SIZE <= len(result):
+            if result[i] != 0x47:
+                i += 1
+                continue
+            afc = (result[i + 3] >> 4) & 0x3
+            # afc 2 = adaptation only, 3 = adaptation + payload; both have AF at byte i+4
+            if afc in (2, 3) and result[i + 4] >= 1:
+                result[i + 5] |= 0x80  # discontinuity_indicator
+            i += PACKET_SIZE
+
+        return bytes(result)
 
     def _broadcast_chunk_to_subscribers(self, stream_id: str, chunk: bytes) -> None:
         """Broadcast a chunk from the primary reader to all subscriber queues."""
@@ -1318,9 +1389,17 @@ class StreamManager:
             chunk_count = 0
             response = None
             stream_context = None
+            stream_iterator = None
             last_stats_update = 0  # Track bytes at last stats update
             vod_reconnects = 0
             failover_count = 0
+            silent_reconnect_count = 0
+            skip_prebuffer = False
+            mark_discontinuity = False
+            chunk_count_at_last_reconnect = 0
+            broke_for_failover = (
+                False  # True when inner loop broke due to failover_event detection
+            )
             # Use configured max or fall back to total available failovers (0 = unlimited)
             configured_max = settings.MAX_FAILOVER_ATTEMPTS
             if configured_max > 0:
@@ -1395,6 +1474,22 @@ class StreamManager:
                             f"Cancel event set before connection attempt for client {client_id}, exiting"
                         )
                         break
+
+                    # Clear any stale failover_event from a previous iteration so it
+                    # can't be mistaken for a new signal on this connection attempt.
+                    # Generators that detect the event clear it themselves; this is
+                    # only a safety net for the cases where they don't (e.g. the
+                    # client disconnected before the next chunk arrived).
+                    stream_info.failover_event.clear()
+
+                    # Any upstream switch — failover or silent reconnect — produces a splice
+                    # point in the TS byte stream. Signal discontinuity so downstream decoders
+                    # (ChannelsDVR, VLC, etc.) reinitialise at the boundary rather than trying
+                    # to decode the new stream as a continuation of the old one.
+                    # silent reconnects set this flag themselves (before their continue), so
+                    # this only triggers for failovers (failover_count > 0).
+                    if failover_count > 0:
+                        mark_discontinuity = True
 
                     try:
                         # Get current URL (may have changed due to failover)
@@ -1513,11 +1608,16 @@ class StreamManager:
                         last_chunk_time = asyncio.get_event_loop().time()
 
                         # Pre-buffering for Strict Live TS Mode
+                        # Skip pre-buffer on silent reconnects to avoid replaying upstream
+                        # rolling-buffer data that was already sent to the client.
                         target_prebuffer = (
                             settings.STRICT_LIVE_TS_PREBUFFER_SIZE
-                            if strict_mode_enabled and stream_info.is_live_continuous
+                            if strict_mode_enabled
+                            and stream_info.is_live_continuous
+                            and not skip_prebuffer
                             else 0
                         )
+                        skip_prebuffer = False
 
                         if target_prebuffer > 0:
                             logger.info(
@@ -1548,6 +1648,12 @@ class StreamManager:
                                         chunk = await stream_iterator.__anext__()
 
                                     # Yield immediately - no separate storage needed
+                                    # Inject discontinuity on the very first pre-buffer chunk
+                                    # after a failover so the player reinitialises decoders
+                                    # before it sees any post-splice data.
+                                    if mark_discontinuity:
+                                        chunk = self._inject_ts_discontinuity(chunk)
+                                        mark_discontinuity = False
                                     yield chunk
                                     self._broadcast_chunk_to_subscribers(
                                         stream_id, chunk
@@ -1603,6 +1709,7 @@ class StreamManager:
                         )
 
                         # Continue streaming from where pre-buffer left off (or from start if no pre-buffer)
+                        broke_for_failover = False
                         while True:
                             try:
                                 # Read next chunk with a per-chunk timeout to detect silent stalls
@@ -1821,10 +1928,14 @@ class StreamManager:
                                         pass
                                 stream_context = None
                                 response = None
+                                broke_for_failover = True
                                 failover_count += 1
                                 # Break inner loop to reconnect with new URL
                                 break
 
+                            if mark_discontinuity:
+                                chunk = self._inject_ts_discontinuity(chunk)
+                                mark_discontinuity = False
                             yield chunk
                             self._broadcast_chunk_to_subscribers(stream_id, chunk)
                             bytes_served += len(chunk)
@@ -2133,6 +2244,14 @@ class StreamManager:
                                     response = None
                                     continue  # Retry with failover URL
 
+                        # If the inner loop broke because failover_event was detected, the
+                        # caller already set current_url to the intended failover URL. Just
+                        # continue the outer loop to reconnect — don't call
+                        # _try_update_failover_url again, which would double-advance to URL #3
+                        # instead of URL #2 (regression: issue #1180, resolver mode).
+                        if broke_for_failover:
+                            continue
+
                         # If we reach here, the upstream response iterator ended without error.
                         # For live continuous streams, this is unexpected — it likely means the
                         # provider silently closed the connection (e.g., connection limit reached).
@@ -2169,8 +2288,50 @@ class StreamManager:
                                 response = None
                                 failover_count += 1
                                 continue  # Retry with failover URL
+                            else:
+                                # No failover configured — silently reconnect to the same URL.
+                                # Providers that close connections periodically (e.g. every 10-15s)
+                                # require this to keep the client (e.g. Channels DVR) connected
+                                # without a full disconnect/reconnect cycle on their end.
+                                # Guard: only reconnect if enough chunks were delivered since the
+                                # last reconnect. A stream that closes after 1-2 chunks has ended
+                                # naturally; a live stream closing after thousands of chunks is a
+                                # periodic provider keep-alive pattern.
+                                chunks_this_connection = (
+                                    chunk_count - chunk_count_at_last_reconnect
+                                )
+                                min_chunks = settings.LIVE_SILENT_RECONNECT_MIN_CHUNKS
+                                if chunks_this_connection < min_chunks:
+                                    logger.info(
+                                        f"Live stream ended after {chunks_this_connection} chunks "
+                                        f"(min {min_chunks} required for silent reconnect), "
+                                        f"treating as natural completion for client {client_id}"
+                                    )
+                                else:
+                                    silent_reconnect_count += 1
+                                    logger.info(
+                                        f"Live stream closed by provider for client {client_id} "
+                                        f"({chunks_this_connection} chunks this connection, "
+                                        f"{bytes_served} bytes total) — "
+                                        f"reconnecting to same URL (silent reconnect #{silent_reconnect_count})"
+                                    )
+                                    if stream_context is not None:
+                                        try:
+                                            await stream_context.__aexit__(
+                                                None, None, None
+                                            )
+                                        except Exception:
+                                            pass
+                                    stream_context = None
+                                    response = None
+                                    # Skip pre-buffer on reconnect to avoid replaying the provider's
+                                    # rolling live buffer and causing a jump-back on the client.
+                                    skip_prebuffer = True
+                                    mark_discontinuity = True
+                                    chunk_count_at_last_reconnect = chunk_count
+                                    continue  # Reconnect to same URL, client stays connected
 
-                        # Stream completed normally (VOD, or live with no failover available)
+                        # Stream completed normally (VOD, or live with failover exhausted)
                         if not stream_info.failover_event.is_set():
                             logger.info(
                                 f"Stream completed for client {client_id}: {chunk_count} chunks, {bytes_served} bytes"
@@ -2389,8 +2550,44 @@ class StreamManager:
                                 response = None
 
                                 continue  # Reconnect outer loop with Range bytes=resume_from_byte-
+                            elif stream_info.is_live_continuous:
+                                # Upstream dropped the connection mid-stream (TCP RST or abrupt close).
+                                # Some providers periodically reset connections (e.g. every 10-15s).
+                                # Treat as an upstream drop, not a client disconnect: silently reconnect
+                                # if enough chunks were delivered so the client stays connected.
+                                chunks_this_connection = (
+                                    chunk_count - chunk_count_at_last_reconnect
+                                )
+                                min_chunks = settings.LIVE_SILENT_RECONNECT_MIN_CHUNKS
+                                if chunks_this_connection >= min_chunks:
+                                    silent_reconnect_count += 1
+                                    logger.info(
+                                        f"Upstream ReadError mid-stream for client {client_id} "
+                                        f"({chunks_this_connection} chunks, {bytes_served} bytes) — "
+                                        f"silently reconnecting (#{silent_reconnect_count})"
+                                    )
+                                    if stream_context is not None:
+                                        try:
+                                            await stream_context.__aexit__(
+                                                None, None, None
+                                            )
+                                        except Exception:
+                                            pass
+                                    stream_context = None
+                                    response = None
+                                    skip_prebuffer = True
+                                    mark_discontinuity = True
+                                    chunk_count_at_last_reconnect = chunk_count
+                                    continue  # Reconnect outer loop, client stays connected
+                                else:
+                                    # Too few chunks — likely a genuine stream end or bad upstream.
+                                    logger.info(
+                                        f"Upstream ReadError after only {chunks_this_connection} chunks "
+                                        f"(min {min_chunks}), treating as stream end for client {client_id}"
+                                    )
+                                    break
                             else:
-                                # Non-VOD or retries exhausted -> treat as client disconnect
+                                # Non-live ReadError mid-stream -> treat as client disconnect
                                 logger.info(
                                     f"Client {client_id} likely disconnected during streaming"
                                 )
@@ -2960,78 +3157,162 @@ class StreamManager:
                 max_failovers = 3  # No failovers configured, keep original default
             is_failover = False  # Track if we broke due to failover
 
-            # Main loop with automatic reconnection on failover
-            while failover_count <= max_failovers:
-                try:
-                    # Get current URL (may have changed due to failover)
-                    active_url = stream_info.current_url or stream_info.original_url
+            # Wrap everything in try/finally so cleanup_client is guaranteed to
+            # run regardless of how the generator exits:
+            #   - return (cancel_event, end-of-stream, early FFmpeg errors)
+            #   - GeneratorExit  (Starlette calls aclose() after client disconnect)
+            #   - CancelledError (asyncio task cancellation)
+            # Without this, every `return` inside the while loop bypasses the
+            # sequential cleanup code at the bottom of the function, leaving
+            # the client registered as active indefinitely.
+            try:
+                # Main loop with automatic reconnection on failover
+                while failover_count <= max_failovers:
+                    # Clear any stale failover_event from a previous iteration.
+                    stream_info.failover_event.clear()
+                    try:
+                        # Get current URL (may have changed due to failover)
+                        active_url = stream_info.current_url or stream_info.original_url
 
-                    if failover_count > 0:
-                        logger.info(
-                            f"Starting failover attempt {failover_count}/{max_failovers} for client {client_id}, "
-                            + f"new URL: {active_url}"
+                        if failover_count > 0:
+                            logger.info(
+                                f"Starting failover attempt {failover_count}/{max_failovers} for client {client_id}, "
+                                + f"new URL: {active_url}"
+                            )
+
+                        # Get or create a shared transcoding process
+                        (
+                            stream_key,
+                            shared_process,
+                        ) = await self.pooled_manager.get_or_create_shared_stream(
+                            url=active_url,
+                            profile=stream_info.transcode_profile,
+                            ffmpeg_args=stream_info.transcode_ffmpeg_args,
+                            client_id=client_id,
+                            user_agent=stream_info.user_agent,
+                            headers=stream_info.headers,
+                            metadata=stream_info.metadata,
+                            stream_id=stream_id,
+                            # Reuse existing key if available
+                            reuse_stream_key=stream_info.transcode_stream_key,
+                            resolver_type=stream_info.resolver_type,
+                            resolver_args=stream_info.resolver_args,
+                            resolver_cookies_path=stream_info.resolver_cookies_path,
                         )
 
-                    # Get or create a shared transcoding process
-                    (
-                        stream_key,
-                        shared_process,
-                    ) = await self.pooled_manager.get_or_create_shared_stream(
-                        url=active_url,
-                        profile=stream_info.transcode_profile,
-                        ffmpeg_args=stream_info.transcode_ffmpeg_args,
-                        client_id=client_id,
-                        user_agent=stream_info.user_agent,
-                        headers=stream_info.headers,
-                        metadata=stream_info.metadata,
-                        stream_id=stream_id,
-                        # Reuse existing key if available
-                        reuse_stream_key=stream_info.transcode_stream_key,
-                        resolver_type=stream_info.resolver_type,
-                        resolver_args=stream_info.resolver_args,
-                        resolver_cookies=stream_info.resolver_cookies,
-                    )
+                        # Update the tracked stream key so future failovers can stop the correct process
+                        stream_info.transcode_stream_key = stream_key
 
-                    # Update the tracked stream key so future failovers can stop the correct process
-                    stream_info.transcode_stream_key = stream_key
-
-                    if (
-                        not shared_process
-                        or not shared_process.process
-                        or not shared_process.process.stdout
-                    ):
-                        # Try failover if available
-                        has_failover = bool(
-                            stream_info.failover_resolver_url
-                            or stream_info.failover_urls
-                        )
-                        if has_failover and failover_count < max_failovers:
-                            logger.warning(
-                                "Failed to create transcoding process, attempting failover"
+                        if (
+                            not shared_process
+                            or not shared_process.process
+                            or not shared_process.process.stdout
+                        ):
+                            # Try failover if available
+                            has_failover = bool(
+                                stream_info.failover_resolver_url
+                                or stream_info.failover_urls
                             )
-                            await self._try_update_failover_url(
-                                stream_id, "transcode_start_error"
-                            )
-                            failover_count += 1
-                            continue
-                        else:
-                            raise HTTPException(
-                                status_code=500,
-                                detail="Failed to get a valid transcoding process",
-                            )
+                            if has_failover and failover_count < max_failovers:
+                                logger.warning(
+                                    "Failed to create transcoding process, attempting failover"
+                                )
+                                await self._try_update_failover_url(
+                                    stream_id, "transcode_start_error"
+                                )
+                                failover_count += 1
+                                continue
+                            else:
+                                raise HTTPException(
+                                    status_code=500,
+                                    detail="Failed to get a valid transcoding process",
+                                )
 
-                    # Wait for FFmpeg to start and stderr monitor to detect input errors
-                    # Poll the status repeatedly to catch errors that occur during startup
-                    # This is especially important for connection errors (DNS failures, 404s, etc.)
-                    max_wait_time = 2.0  # Wait up to 2 seconds
-                    check_interval = 0.1  # Check every 100ms
-                    elapsed = 0.0
+                        # Wait for FFmpeg to start and stderr monitor to detect input errors
+                        # Poll the status repeatedly to catch errors that occur during startup
+                        # This is especially important for connection errors (DNS failures, 404s, etc.)
+                        max_wait_time = 2.0  # Wait up to 2 seconds
+                        check_interval = 0.1  # Check every 100ms
+                        elapsed = 0.0
 
-                    while elapsed < max_wait_time:
-                        await asyncio.sleep(check_interval)
-                        elapsed += check_interval
+                        while elapsed < max_wait_time:
+                            await asyncio.sleep(check_interval)
+                            elapsed += check_interval
 
-                        # Check if the process failed due to input errors (detected by stderr monitor)
+                            # Check if the process failed due to input errors (detected by stderr monitor)
+                            if (
+                                hasattr(shared_process, "status")
+                                and shared_process.status == "input_failed"
+                            ):
+                                has_failover = bool(
+                                    stream_info.failover_resolver_url
+                                    or stream_info.failover_urls
+                                )
+                                if has_failover and failover_count < max_failovers:
+                                    logger.warning(
+                                        f"Transcoding process failed due to input error before streaming (detected after {elapsed:.1f}s), attempting failover"
+                                    )
+                                    # Clean up failed process
+                                    if self.pooled_manager:
+                                        try:
+                                            await self.pooled_manager.force_stop_stream(
+                                                stream_key
+                                            )
+                                        except Exception:
+                                            pass
+                                    stream_key = None
+                                    await self._try_update_failover_url(
+                                        stream_id, "transcode_input_error"
+                                    )
+                                    failover_count += 1
+                                    break  # Break out of wait loop to continue outer loop
+                                else:
+                                    # No failover available - log error and return empty stream
+                                    logger.error(
+                                        f"Transcoding process failed due to input error and no failover available for stream {stream_id}"
+                                    )
+                                    return
+
+                            # Check if process has exited early
+                            if shared_process.process.returncode is not None:
+                                has_failover = bool(
+                                    stream_info.failover_resolver_url
+                                    or stream_info.failover_urls
+                                )
+                                if has_failover and failover_count < max_failovers:
+                                    logger.warning(
+                                        f"Transcoding process exited before streaming (detected after {elapsed:.1f}s), attempting failover"
+                                    )
+                                    # Clean up failed process
+                                    if self.pooled_manager and stream_key:
+                                        try:
+                                            await self.pooled_manager.force_stop_stream(
+                                                stream_key
+                                            )
+                                        except Exception:
+                                            pass
+                                    stream_key = None
+                                    await self._try_update_failover_url(
+                                        stream_id, "transcode_process_exited"
+                                    )
+                                    failover_count += 1
+                                    break  # Break out of wait loop to continue outer loop
+                                else:
+                                    logger.error(
+                                        f"Transcoding process exited with code {shared_process.process.returncode} and no failover available for stream {stream_id}"
+                                    )
+                                    return
+
+                            # If we have data in the queue, FFmpeg is producing output - safe to start streaming
+                            client_queue = shared_process.client_queues.get(client_id)
+                            if client_queue and not client_queue.empty():
+                                logger.info(
+                                    f"FFmpeg process producing data after {elapsed:.1f}s, starting stream"
+                                )
+                                break
+
+                        # Check one final time after the wait loop before proceeding
+                        # (in case we timed out without detecting the issue)
                         if (
                             hasattr(shared_process, "status")
                             and shared_process.status == "input_failed"
@@ -3042,9 +3323,8 @@ class StreamManager:
                             )
                             if has_failover and failover_count < max_failovers:
                                 logger.warning(
-                                    f"Transcoding process failed due to input error before streaming (detected after {elapsed:.1f}s), attempting failover"
+                                    "Transcoding process failed due to input error (final check), attempting failover"
                                 )
-                                # Clean up failed process
                                 if self.pooled_manager:
                                     try:
                                         await self.pooled_manager.force_stop_stream(
@@ -3057,15 +3337,14 @@ class StreamManager:
                                     stream_id, "transcode_input_error"
                                 )
                                 failover_count += 1
-                                break  # Break out of wait loop to continue outer loop
+                                continue
                             else:
-                                # No failover available - log error and return empty stream
                                 logger.error(
                                     f"Transcoding process failed due to input error and no failover available for stream {stream_id}"
                                 )
                                 return
 
-                        # Check if process has exited early
+                        # Verify the process is actually running (final check)
                         if shared_process.process.returncode is not None:
                             has_failover = bool(
                                 stream_info.failover_resolver_url
@@ -3073,7 +3352,7 @@ class StreamManager:
                             )
                             if has_failover and failover_count < max_failovers:
                                 logger.warning(
-                                    f"Transcoding process exited before streaming (detected after {elapsed:.1f}s), attempting failover"
+                                    "Transcoding process exited before streaming, attempting failover"
                                 )
                                 # Clean up failed process
                                 if self.pooled_manager and stream_key:
@@ -3088,270 +3367,222 @@ class StreamManager:
                                     stream_id, "transcode_process_exited"
                                 )
                                 failover_count += 1
-                                break  # Break out of wait loop to continue outer loop
+                                continue
                             else:
+                                # No failover available - log error and return empty stream
+                                # Cannot raise HTTPException here as response may have already started
                                 logger.error(
                                     f"Transcoding process exited with code {shared_process.process.returncode} and no failover available for stream {stream_id}"
                                 )
                                 return
 
-                        # If we have data in the queue, FFmpeg is producing output - safe to start streaming
+                        logger.info(
+                            f"Streaming from FFmpeg process PID {shared_process.process.pid} for client {client_id}"
+                        )
+
+                        # Get the client's queue - the broadcaster will feed chunks into it
                         client_queue = shared_process.client_queues.get(client_id)
-                        if client_queue and not client_queue.empty():
-                            logger.info(
-                                f"FFmpeg process producing data after {elapsed:.1f}s, starting stream"
+                        if not client_queue:
+                            raise HTTPException(
+                                status_code=500, detail="Client queue not found"
                             )
-                            break
 
-                    # Check one final time after the wait loop before proceeding
-                    # (in case we timed out without detecting the issue)
-                    if (
-                        hasattr(shared_process, "status")
-                        and shared_process.status == "input_failed"
-                    ):
-                        has_failover = bool(
-                            stream_info.failover_resolver_url
-                            or stream_info.failover_urls
-                        )
-                        if has_failover and failover_count < max_failovers:
-                            logger.warning(
-                                "Transcoding process failed due to input error (final check), attempting failover"
-                            )
-                            if self.pooled_manager:
-                                try:
-                                    await self.pooled_manager.force_stop_stream(
-                                        stream_key
-                                    )
-                                except Exception:
-                                    pass
-                            stream_key = None
-                            await self._try_update_failover_url(
-                                stream_id, "transcode_input_error"
-                            )
-                            failover_count += 1
-                            continue
-                        else:
-                            logger.error(
-                                f"Transcoding process failed due to input error and no failover available for stream {stream_id}"
-                            )
-                            return
-
-                    # Verify the process is actually running (final check)
-                    if shared_process.process.returncode is not None:
-                        has_failover = bool(
-                            stream_info.failover_resolver_url
-                            or stream_info.failover_urls
-                        )
-                        if has_failover and failover_count < max_failovers:
-                            logger.warning(
-                                "Transcoding process exited before streaming, attempting failover"
-                            )
-                            # Clean up failed process
-                            if self.pooled_manager and stream_key:
-                                try:
-                                    await self.pooled_manager.force_stop_stream(
-                                        stream_key
-                                    )
-                                except Exception:
-                                    pass
-                            stream_key = None
-                            await self._try_update_failover_url(
-                                stream_id, "transcode_process_exited"
-                            )
-                            failover_count += 1
-                            continue
-                        else:
-                            # No failover available - log error and return empty stream
-                            # Cannot raise HTTPException here as response may have already started
-                            logger.error(
-                                f"Transcoding process exited with code {shared_process.process.returncode} and no failover available for stream {stream_id}"
-                            )
-                            return
-
-                    logger.info(
-                        f"Streaming from FFmpeg process PID {shared_process.process.pid} for client {client_id}"
-                    )
-
-                    # Get the client's queue - the broadcaster will feed chunks into it
-                    client_queue = shared_process.client_queues.get(client_id)
-                    if not client_queue:
-                        raise HTTPException(
-                            status_code=500, detail="Client queue not found"
-                        )
-
-                    # Stream data from the client's queue (fed by broadcaster)
-                    while True:
-                        # Check if streaming should be cancelled
-                        if cancel_event.is_set():
-                            logger.info(
-                                f"Transcoded streaming cancelled for client {client_id} by external request"
-                            )
-                            return
-
-                        # Check if the transcoding process failed due to input error during streaming
-                        if (
-                            hasattr(shared_process, "status")
-                            and shared_process.status == "input_failed"
-                        ):
-                            has_failover = bool(
-                                stream_info.failover_resolver_url
-                                or stream_info.failover_urls
-                            )
-                            if has_failover and failover_count < max_failovers:
-                                logger.warning(
-                                    "Transcoding process encountered input error during streaming, triggering failover"
+                        # Stream data from the client's queue (fed by broadcaster)
+                        while True:
+                            # Check if streaming should be cancelled
+                            if cancel_event.is_set():
+                                logger.info(
+                                    f"Transcoded streaming cancelled for client {client_id} by external request"
                                 )
+                                return
+
+                            # Check if the transcoding process failed due to input error during streaming
+                            if (
+                                hasattr(shared_process, "status")
+                                and shared_process.status == "input_failed"
+                            ):
+                                has_failover = bool(
+                                    stream_info.failover_resolver_url
+                                    or stream_info.failover_urls
+                                )
+                                if has_failover and failover_count < max_failovers:
+                                    logger.warning(
+                                        "Transcoding process encountered input error during streaming, triggering failover"
+                                    )
+                                    # Clean up current connection
+                                    if client_id and stream_key and self.pooled_manager:
+                                        try:
+                                            await self.pooled_manager.remove_client_from_stream(
+                                                client_id
+                                            )
+                                            await self.pooled_manager.force_stop_stream(
+                                                stream_key
+                                            )
+                                        except Exception as e:
+                                            logger.warning(
+                                                f"Error cleaning up failed stream: {e}"
+                                            )
+                                    stream_key = None
+                                    await self._try_update_failover_url(
+                                        stream_id, "transcode_runtime_input_error"
+                                    )
+                                    is_failover = True  # Keep client connection alive during failover
+                                    failover_count += 1
+                                    break
+                                else:
+                                    logger.error(
+                                        "Transcoding failed due to input error and no failover available"
+                                    )
+                                    return
+
+                            # Check for failover event
+                            if stream_info.failover_event.is_set():
+                                logger.info(
+                                    f"Failover detected for transcoded stream {stream_id}, will reconnect client {client_id} to new URL: {stream_info.current_url}"
+                                )
+
+                                # IMPORTANT: Clear the event immediately so other checks don't trigger
+                                # This prevents infinite loop where event keeps getting detected
+                                stream_info.failover_event.clear()
+
                                 # Clean up current connection
                                 if client_id and stream_key and self.pooled_manager:
                                     try:
                                         await self.pooled_manager.remove_client_from_stream(
                                             client_id
                                         )
-                                        await self.pooled_manager.force_stop_stream(
-                                            stream_key
+                                        logger.info(
+                                            f"Removed client {client_id} from old stream {stream_key}"
                                         )
                                     except Exception as e:
                                         logger.warning(
-                                            f"Error cleaning up failed stream: {e}"
+                                            f"Error removing client from old stream: {e}"
                                         )
+                                # Clear the stream_key so we don't try to clean it up again
                                 stream_key = None
-                                await self._try_update_failover_url(
-                                    stream_id, "transcode_runtime_input_error"
-                                )
-                                is_failover = (
-                                    True  # Keep client connection alive during failover
-                                )
+                                is_failover = True  # Mark that we're doing a failover
                                 failover_count += 1
+                                # Break inner loop to reconnect with new URL
                                 break
-                            else:
-                                logger.error(
-                                    "Transcoding failed due to input error and no failover available"
+
+                            # Get chunk from queue (broadcaster puts chunks here) with timeout
+                            # to allow checking cancellation event periodically
+                            try:
+                                chunk = await asyncio.wait_for(
+                                    client_queue.get(), timeout=0.5
+                                )
+                            except asyncio.TimeoutError:
+                                # No chunk available, loop back to check cancellation/failover
+                                continue
+
+                            if chunk is None:  # None signals end of stream
+                                # The broadcaster sends None when FFmpeg stops. If _try_update_failover_url
+                                # triggered that stop (it kills FFmpeg before the generator can check
+                                # failover_event in the normal place), catch it here so the client
+                                # stays connected and reconnects to the new URL.
+                                if stream_info.failover_event.is_set():
+                                    stream_info.failover_event.clear()
+                                    logger.info(
+                                        f"Failover detected via queue None for transcoded stream {stream_id}, "
+                                        f"reconnecting client {client_id} to new URL: {stream_info.current_url}"
+                                    )
+                                    if client_id and stream_key and self.pooled_manager:
+                                        try:
+                                            await self.pooled_manager.remove_client_from_stream(
+                                                client_id
+                                            )
+                                        except Exception as e:
+                                            logger.warning(
+                                                f"Error removing client from old stream during queue-None failover: {e}"
+                                            )
+                                    stream_key = None
+                                    is_failover = True
+                                    failover_count += 1
+                                    break
+                                logger.info(
+                                    f"Transcoded streaming ended for client {client_id}"
                                 )
                                 return
 
-                        # Check for failover event
-                        if stream_info.failover_event.is_set():
-                            logger.info(
-                                f"Failover detected for transcoded stream {stream_id}, will reconnect client {client_id} to new URL: {stream_info.current_url}"
-                            )
+                            yield chunk
+                            bytes_served += len(chunk)
 
-                            # IMPORTANT: Clear the event immediately so other checks don't trigger
-                            # This prevents infinite loop where event keeps getting detected
-                            stream_info.failover_event.clear()
+                            # Update client activity and idle tracking
+                            if self.pooled_manager:
+                                self.pooled_manager.update_client_activity(client_id)
+                            if client_id in self.clients:
+                                now = datetime.now(timezone.utc)
+                                self.clients[client_id].last_access = now
+                                # Track transcoded stream data flow
+                                self.clients[client_id].last_data_time = now
+                                self.clients[client_id].bytes_served += len(chunk)
 
-                            # Clean up current connection
-                            if client_id and stream_key and self.pooled_manager:
-                                try:
-                                    await self.pooled_manager.remove_client_from_stream(
-                                        client_id
-                                    )
-                                    logger.info(
-                                        f"Removed client {client_id} from old stream {stream_key}"
-                                    )
-                                except Exception as e:
-                                    logger.warning(
-                                        f"Error removing client from old stream: {e}"
-                                    )
-                            # Clear the stream_key so we don't try to clean it up again
-                            stream_key = None
-                            is_failover = True  # Mark that we're doing a failover
-                            failover_count += 1
-                            # Break inner loop to reconnect with new URL
+                            # Update stream-level stats (for bandwidth tracking)
+                            if stream_id in self.streams:
+                                self.streams[stream_id].total_bytes_served += len(chunk)
+                                self.streams[stream_id].last_access = datetime.now(
+                                    timezone.utc
+                                )
+
+                            # Update global stats
+                            self._stats.total_bytes_served += len(chunk)
+
+                        # If we broke due to failover, continue to next iteration to reconnect
+                        if is_failover:
+                            is_failover = False  # Reset flag
+                            continue
+                        else:
+                            # Normal completion - break outer loop
                             break
 
-                        # Get chunk from queue (broadcaster puts chunks here) with timeout
-                        # to allow checking cancellation event periodically
-                        try:
-                            chunk = await asyncio.wait_for(
-                                client_queue.get(), timeout=0.5
-                            )
-                        except asyncio.TimeoutError:
-                            # No chunk available, loop back to check cancellation/failover
-                            continue
+                    except (HTTPException, ConnectionError, BrokenPipeError) as e:
+                        logger.error(
+                            f"Error during pooled transcoding for client {client_id}: {e}"
+                        )
 
-                        if chunk is None:  # None signals end of stream
+                        # Try automatic failover (check both resolver URL and static list)
+                        has_failover = bool(
+                            stream_info.failover_resolver_url
+                            or stream_info.failover_urls
+                        )
+                        if has_failover and failover_count < max_failovers:
                             logger.info(
-                                f"Transcoded streaming ended for client {client_id}"
+                                f"Attempting automatic failover for transcoded stream (attempt {failover_count + 1}/{max_failovers})"
                             )
-                            return
-
-                        yield chunk
-                        bytes_served += len(chunk)
-
-                        # Update client activity and idle tracking
-                        if self.pooled_manager:
-                            self.pooled_manager.update_client_activity(client_id)
-                        if client_id in self.clients:
-                            now = datetime.now(timezone.utc)
-                            self.clients[client_id].last_access = now
-                            # Track transcoded stream data flow
-                            self.clients[client_id].last_data_time = now
-                            self.clients[client_id].bytes_served += len(chunk)
-
-                        # Update stream-level stats (for bandwidth tracking)
-                        if stream_id in self.streams:
-                            self.streams[stream_id].total_bytes_served += len(chunk)
-                            self.streams[stream_id].last_access = datetime.now(
-                                timezone.utc
+                            await self._try_update_failover_url(
+                                stream_id, f"transcode_error_{type(e).__name__}"
                             )
+                            # Clean up current connection
+                            if client_id and stream_key and self.pooled_manager:
+                                await self.pooled_manager.remove_client_from_stream(
+                                    client_id
+                                )
+                            failover_count += 1
+                            continue
+                        else:
+                            raise
 
-                        # Update global stats
-                        self._stats.total_bytes_served += len(chunk)
-
-                    # If we broke due to failover, continue to next iteration to reconnect
-                    if is_failover:
-                        is_failover = False  # Reset flag
-                        continue
-                    else:
-                        # Normal completion - break outer loop
+                    except Exception as e:
+                        logger.error(
+                            f"Unexpected error during pooled transcoding for client {client_id}: {e}"
+                        )
+                        # Don't retry on unexpected exceptions
                         break
 
-                except (HTTPException, ConnectionError, BrokenPipeError) as e:
-                    logger.error(
-                        f"Error during pooled transcoding for client {client_id}: {e}"
-                    )
-
-                    # Try automatic failover (check both resolver URL and static list)
-                    has_failover = bool(
-                        stream_info.failover_resolver_url or stream_info.failover_urls
-                    )
-                    if has_failover and failover_count < max_failovers:
-                        logger.info(
-                            f"Attempting automatic failover for transcoded stream (attempt {failover_count + 1}/{max_failovers})"
-                        )
-                        await self._try_update_failover_url(
-                            stream_id, f"transcode_error_{type(e).__name__}"
-                        )
-                        # Clean up current connection
-                        if client_id and stream_key and self.pooled_manager:
-                            await self.pooled_manager.remove_client_from_stream(
-                                client_id
-                            )
-                        failover_count += 1
-                        continue
-                    else:
-                        raise
-
-                except Exception as e:
-                    logger.error(
-                        f"Unexpected error during pooled transcoding for client {client_id}: {e}"
-                    )
-                    # Don't retry on unexpected exceptions
-                    break
-
-            # Final cleanup after all retries exhausted or normal completion
-            # Clean up: remove client from the shared stream
-            if client_id and stream_key and self.pooled_manager:
-                try:
-                    await self.pooled_manager.remove_client_from_stream(client_id)
-                except Exception:
-                    pass
-
-            # Final client cleanup - pass connection_id to prevent race conditions
-            await self.cleanup_client(client_id, connection_id)
-            logger.info(
-                f"Finished pooled stream for client {client_id}, served {bytes_served} bytes"
-            )
+            finally:
+                # Guaranteed cleanup for ALL exit paths:
+                #   - return (cancel_event, end-of-stream, FFmpeg errors)
+                #   - GeneratorExit (Starlette aclose() after client disconnect)
+                #   - CancelledError (asyncio task cancellation)
+                if client_id and stream_key and self.pooled_manager:
+                    try:
+                        await self.pooled_manager.remove_client_from_stream(client_id)
+                    except Exception:
+                        pass
+                await self.cleanup_client(client_id, connection_id)
+                logger.info(
+                    f"Finished pooled stream for client {client_id}, served {bytes_served} bytes"
+                )
 
         headers = {
             "Content-Type": None,
@@ -3937,6 +4168,25 @@ class StreamManager:
                     )
                     return None
 
+    @staticmethod
+    def _segment_content_type(segment_url: str) -> str:
+        """Infer the response Content-Type for an HLS segment from its URL.
+
+        Defaults to MPEG-TS so existing .ts pass-through stays bit-exact.
+        fMP4/CMAF segments need their own MIME so strict players (e.g. Apple
+        AVKit on tvOS) can decode HEVC content carried in fragmented MP4.
+        """
+        path = segment_url.split("?", 1)[0].lower()
+        if path.endswith((".m4s", ".cmfv", ".cmfa", ".cmft")):
+            return "video/iso.segment"
+        if path.endswith(".mp4"):
+            return "video/mp4"
+        if path.endswith(".aac"):
+            return "audio/aac"
+        if path.endswith(".vtt"):
+            return "text/vtt"
+        return "video/mp2t"
+
     async def proxy_hls_segment(
         self,
         stream_id: str,
@@ -4050,9 +4300,10 @@ class StreamManager:
                     logger.error(f"Unexpected error streaming HLS segment: {e}")
                     raise
 
+        media_type = self._segment_content_type(segment_url)
         return StreamingResponse(
             segment_generator(),
-            media_type="video/MP2T",
+            media_type=media_type,
             headers={
                 "Cache-Control": "no-cache",
                 "Access-Control-Allow-Origin": "*",
@@ -4255,20 +4506,27 @@ class StreamManager:
         stream_info.failover_event.clear()
         stream_info.failover_event.set()
 
-        # For transcoded streams, stop and restart the transcoding process
+        # For transcoded streams, stop and restart the transcoding process.
+        # Clear the stream key BEFORE awaiting force_stop_stream — otherwise a
+        # client coroutine woken by failover_event can read the still-set
+        # transcode_stream_key and pass it as reuse_stream_key, which creates a
+        # new SharedTranscodingProcess at the same key. The tail-end
+        # _cleanup_local_process inside force_stop_stream then pops whatever is
+        # at that key (the brand-new process) and tears down its ffmpeg, killing
+        # the failover stream a couple of seconds after it started.
         if stream_info.is_transcoded and self.pooled_manager:
-            try:
-                # Stop the old transcoding process
-                if stream_info.transcode_stream_key:
+            old_stream_key = stream_info.transcode_stream_key
+            stream_info.transcode_stream_key = None
+            if old_stream_key:
+                try:
                     logger.info(
-                        f"Stopping transcoding process for failover: {stream_info.transcode_stream_key}"
+                        f"Stopping transcoding process for failover: {old_stream_key}"
                     )
-                    await self.pooled_manager.force_stop_stream(
-                        stream_info.transcode_stream_key
+                    await self.pooled_manager.force_stop_stream(old_stream_key)
+                except Exception as e:
+                    logger.error(
+                        f"Error stopping transcoding process during failover: {e}"
                     )
-                    stream_info.transcode_stream_key = None
-            except Exception as e:
-                logger.error(f"Error stopping transcoding process during failover: {e}")
 
         # Emit failover event
         await self._emit_event(
@@ -4284,9 +4542,9 @@ class StreamManager:
             },
         )
 
-        # Reset the event for next failover
-        await asyncio.sleep(0.1)  # Give clients time to detect the event
-        stream_info.failover_event.clear()
+        # Generators clear failover_event themselves on detection (direct: line ~1850,
+        # transcoded: queue-None handler). No sleep needed here — removing the timer
+        # avoids blocking the API response and eliminates the stale-event window.
 
         return True
 
@@ -4309,12 +4567,33 @@ class StreamManager:
         """Clean up clients that haven't been accessed recently"""
         current_time = datetime.now(timezone.utc)
         inactive_clients = []
+        chunk_timeout = getattr(settings, "LIVE_CHUNK_TIMEOUT_SECONDS", 15.0)
 
         for client_id, client_info in self.clients.items():
             if (
                 current_time - client_info.last_access
-            ).total_seconds() > self.client_timeout:
-                inactive_clients.append(client_id)
+            ).total_seconds() <= self.client_timeout:
+                continue
+
+            # Client has exceeded the inactive threshold. Before evicting,
+            # check last_data_time (updated on every chunk, unlike last_access
+            # which is every 10 chunks). If data flowed more recently than the
+            # chunk timeout, the generator is mid-stall and its own chunk
+            # timeout will fire shortly — don't race it. If data is older than
+            # the chunk timeout, either the chunk timeout already fired and
+            # cleaned up, or the generator is genuinely stuck (e.g. client
+            # dropped behind a reverse proxy and ASGI disconnect never arrived).
+            # In both cases it's safe to evict here.
+            data_elapsed = (current_time - client_info.last_data_time).total_seconds()
+            if data_elapsed < chunk_timeout:
+                logger.debug(
+                    f"Skipping inactive cleanup for client {client_id}: "
+                    f"data flowed {data_elapsed:.1f}s ago (chunk_timeout={chunk_timeout}s), "
+                    f"letting chunk timeout handle it"
+                )
+                continue
+
+            inactive_clients.append(client_id)
 
         for client_id in inactive_clients:
             await self.cleanup_client(client_id)
@@ -4471,6 +4750,34 @@ class StreamManager:
                     client_info.idle_warning_logged = False
                     client_info.idle_error_logged = False
 
+    def _get_media_info(self, stream: "StreamInfo") -> Dict[str, Any]:
+        """
+        Look up live media info (codec/container/resolution/bitrate/fps) for a
+        stream. Returns an empty dict for non-transcoded streams since live
+        ffmpeg metadata only exists when ffmpeg is the active producer.
+        """
+        if not stream.transcode_stream_key or not self.pooled_manager:
+            return {}
+        process = self.pooled_manager.shared_processes.get(stream.transcode_stream_key)
+        if not process:
+            return {}
+        return dict(getattr(process, "media_info", {}) or {})
+
+    def _get_output_media_info(self, stream: "StreamInfo") -> Dict[str, Any]:
+        """
+        Look up live encoder/muxer output info for a transcoded stream — the
+        codec/container/resolution ffmpeg has been told to produce, plus the
+        live progress fields that describe what's being written downstream.
+        Empty for non-transcoded streams (no ffmpeg process) or before ffmpeg
+        emits its "Output #" line.
+        """
+        if not stream.transcode_stream_key or not self.pooled_manager:
+            return {}
+        process = self.pooled_manager.shared_processes.get(stream.transcode_stream_key)
+        if not process:
+            return {}
+        return dict(getattr(process, "output_media_info", {}) or {})
+
     def get_stats(self) -> Dict:
         """Get comprehensive stats - aggregates variant stream stats into parent streams"""
         # Only count non-variant streams
@@ -4602,6 +4909,8 @@ class StreamManager:
                     "last_access": stream.last_access.isoformat(),
                     "metadata": stream.metadata,
                     "headers": stream.headers,
+                    "media_info": self._get_media_info(stream),
+                    "output_media_info": self._get_output_media_info(stream),
                 }
                 for stream in non_variant_streams
             ],

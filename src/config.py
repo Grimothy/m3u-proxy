@@ -2,7 +2,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
 
 # Application version
-VERSION = "0.4.5"
+VERSION = "0.4.21"
 
 
 class Settings(BaseSettings):
@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     # work automatically with any reverse proxy setup.
     # PUBLIC_URL: Optional[str] = None
     LOG_LEVEL: str = "error"
+    LOG_ANONYMIZE: bool = True
     APP_DEBUG: bool = False
     RELOAD: bool = False
     DOCS_URL: str = "/docs"
@@ -62,11 +63,16 @@ class Settings(BaseSettings):
     CONNECTION_IDLE_ERROR_THRESHOLD: int = 1800
     # Enable connection idle monitoring (can be disabled for high-throughput scenarios)
     ENABLE_CONNECTION_IDLE_MONITORING: bool = True
+    # Set to True to disable the ASGI http.disconnect monitor and rely solely
+    # on the periodic cleanup / chunk-timeout paths. Useful for testing the
+    # timeout-based disconnect handling without needing a reverse proxy.
+    DISABLE_ASGI_DISCONNECT_MONITOR: bool = False
 
     # Additional configuration from .env file
     DEFAULT_RETRY_ATTEMPTS: int = 3
     DEFAULT_RETRY_DELAY: int = 5
     TEMP_DIR: str = "/tmp/m3u-proxy-streams"
+    LOG_DIR: str = "logs"
     LOG_FILE: str = "m3u-proxy.log"
 
     # Redis Configuration for pooling and multi-worker coordination
@@ -127,6 +133,11 @@ class Settings(BaseSettings):
     STRICT_LIVE_TS_CIRCUIT_BREAKER_COOLDOWN: int = 60
     # Maximum chunk wait time in seconds for pre-buffer (to avoid infinite wait)
     STRICT_LIVE_TS_PREBUFFER_TIMEOUT: int = 10
+
+    # Minimum chunks per upstream connection before a silent reconnect is attempted.
+    # Prevents infinite reconnect loops when a stream ends naturally after a few chunks.
+    # At 32KB chunks and typical IPTV bitrates, a 10s+ connection delivers 300-2000 chunks.
+    LIVE_SILENT_RECONNECT_MIN_CHUNKS: int = 10
 
     # Bitrate Quality Monitoring - detect slow/degraded streams and trigger failover
     # Enable bitrate monitoring for automatic failover on degraded streams

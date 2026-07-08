@@ -144,7 +144,8 @@ class NetworkBroadcastProcess:
         self._poll_task: Optional[asyncio.Task] = None
         self._stopping = False
         self._bytes_written: int = 0  # Cumulative bytes across all segments ever seen
-        self._seen_segments: Set[str] = set()  # Segment filenames already counted
+        # Segment filenames already counted
+        self._seen_segments: Set[str] = set()
         # Populated by _resolve_subtitle_state() before the command is built.
         # None = no subtitle stream detected (or subtitles_enabled is False) —
         # the command falls back to the original single-playlist output.
@@ -777,7 +778,8 @@ class NetworkBroadcastProcess:
         "time=",  # Time stats
         "bitrate=",  # Bitrate stats
         "speed=",  # Speed stats
-        "size=",  # Size stats (N/A for HLS stream-copy; tracked via segment polling)
+        # Size stats (N/A for HLS stream-copy; tracked via segment polling)
+        "size=",
         "resumed reading",  # Reconnection noise
         "opening",  # File opening messages (lowercase)
         "muxing overhead",  # Summary stats
@@ -1261,6 +1263,9 @@ class BroadcastManager:
         self.hls_base_dir = hls_base_dir or getattr(
             settings, "HLS_BROADCAST_DIR", "/tmp/m3u-proxy-broadcasts"
         )
+        self.dvr_base_dir: str = getattr(
+            settings, "DVR_RECORDING_DIR", "/tmp/m3u-proxy-dvr"
+        )
         self.broadcasts: Dict[str, NetworkBroadcastProcess] = {}
         self._lock = asyncio.Lock()
 
@@ -1469,11 +1474,23 @@ class BroadcastManager:
         """Read the HLS playlist content for a network."""
         if network_id not in self.broadcasts:
             # Check if directory exists even without active broadcast (for recovery).
-            # Prefer master.m3u8 (subtitles active) over the flat live.m3u8.
-            broadcast_dir = os.path.join(self.hls_base_dir, f"broadcast_{network_id}")
-            playlist_path = os.path.join(broadcast_dir, "master.m3u8")
-            if not os.path.exists(playlist_path):
-                playlist_path = os.path.join(broadcast_dir, "live.m3u8")
+            # Active broadcasts with subtitles write master.m3u8; fall back to live.m3u8.
+            # DVR recordings (post-broadcast) live in dvr_base_dir and only have live.m3u8.
+            playlist_path = None
+            hls_broadcast_dir = os.path.join(self.hls_base_dir, f"broadcast_{network_id}")
+            for candidate_name in ("master.m3u8", "live.m3u8"):
+                candidate = os.path.join(hls_broadcast_dir, candidate_name)
+                if os.path.exists(candidate):
+                    playlist_path = candidate
+                    break
+            if playlist_path is None:
+                dvr_candidate = os.path.join(
+                    self.dvr_base_dir, f"broadcast_{network_id}", "live.m3u8"
+                )
+                if os.path.exists(dvr_candidate):
+                    playlist_path = dvr_candidate
+            if playlist_path is None:
+                return None
             if os.path.exists(playlist_path):
                 try:
                     with open(playlist_path, "r") as f:
@@ -1506,11 +1523,15 @@ class BroadcastManager:
         if network_id in self.broadcasts:
             return self.broadcasts[network_id].get_segment_path(filename)
 
-        # Check directory even without active broadcast
-        segment_path = os.path.join(
-            self.hls_base_dir, f"broadcast_{network_id}", safe_filename
-        )
-        return segment_path if os.path.exists(segment_path) else None
+        # Check directory even without active broadcast.
+        # DVR recordings use dvr_base_dir; live broadcasts use hls_base_dir.
+        for base_dir in (self.dvr_base_dir, self.hls_base_dir):
+            segment_path = os.path.join(
+                base_dir, f"broadcast_{network_id}", safe_filename
+            )
+            if os.path.exists(segment_path):
+                return segment_path
+        return None
 
     async def cleanup_broadcast(self, network_id: str) -> bool:
         """Clean up broadcast directory and files."""
