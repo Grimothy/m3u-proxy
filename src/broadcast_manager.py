@@ -336,38 +336,59 @@ class NetworkBroadcastProcess:
                 ffmpeg_cmd = [
                     "ffmpeg", "-y", "-loglevel", "error",
                     "-i", self.config.stream_url,
-                    "-t", "0.5",
+                    "-t", "1.0",  # 1.0s — long enough to ensure TS sync + first GOP
                     "-c", "copy",
                     "-f", "mpegts",
                     tmp_path,
                 ]
-                subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=10)
+                subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=15)
+                # Don't `-select_streams v`: some byte-seek positions land on fragments
+                # where ffmpeg's bin parser doesn't register a typed "video" stream
+                # (the cut falls between TS sync + PES headers), so the video filter
+                # returns empty stdout. Without the filter, the FIRST packet's PTS
+                # is reliably the GOP-boundary marker for whatever stream it belongs to;
+                # the audio packet right next to the video one has effectively the
+                # same offset (~1-3s after byte-seek), so audio PTS is a valid proxy
+                # for the GOP drift.
                 result = subprocess.run(
                     [
                         "ffprobe", "-v", "error",
                         "-show_entries", "packet=pts_time",
-                        "-select_streams", "v",
                         "-of", "csv=p=0",
                         tmp_path,
                     ],
                     capture_output=True, text=True, timeout=5,
                 )
                 if result.returncode == 0 and result.stdout:
-                    pts_str = result.stdout.strip().split("\n")[0].rstrip(",")
-                    if pts_str in ("N/A", "", "nan", "NaN"):
+                    # Parse the first non-blank, parseable PTS line.
+                    pts = None
+                    for line in result.stdout.splitlines():
+                        candidate = line.rstrip(",").strip()
+                        if not candidate or candidate in ("N/A", "nan", "NaN"):
+                            continue
+                        try:
+                            pts = float(candidate)
+                            break
+                        except ValueError:
+                            continue
+                    if pts is None:
                         logger.debug(
-                            f"Broadcast {self.network_id}: ffprobe returned no PTS "
-                            f"for first video packet ('{pts_str}'); skipping drift correction"
+                            f"Broadcast {self.network_id}: ffprobe returned no usable PTS "
+                            f"in tmp file; skipping drift correction"
                         )
                         self._cached_video_first_pts = 0.0
                         return 0.0
-                    pts = float(pts_str)
                     self._cached_video_first_pts = pts
                     logger.info(
                         f"Broadcast {self.network_id}: video first PTS = {pts:.3f}s "
                         f"(after #range= byte-seek; will apply -itsoffset +{pts:.3f} on subtitle input)"
                     )
                     return pts
+                else:
+                    logger.debug(
+                        f"Broadcast {self.network_id}: ffprobe returned empty stdout "
+                        f"(rc={result.returncode}); skipping drift correction"
+                    )
             finally:
                 try:
                     os.unlink(tmp_path)

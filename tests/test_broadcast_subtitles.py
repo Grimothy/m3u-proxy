@@ -802,3 +802,66 @@ def test_probe_video_first_pts_returns_correct_value(monkeypatch):
     # Second call should return the cached value (no second subprocess call).
     pts2 = proc._probe_video_first_pts()
     assert pts2 == 1.483
+
+
+def test_probe_video_first_pts_falls_back_to_audio_when_video_filter_empty(monkeypatch):
+    """
+    Regression test for the bin_data edge case: when ffmpeg's byte-seek lands on a
+    TS fragment where the video stream isn't registered (only `bin_data` and audio),
+    `-select_streams v` returns empty stdout. The probe now omits the video filter
+    and parses the first non-blank parseable PTS line — for MPEG-TS, audio packets
+    arrive at effectively the same GOP-boundary offset as video packets, so the
+    audio PTS is a valid drift proxy.
+    """
+    cfg = BroadcastConfig(
+        network_id="bin_data_fallback",
+        stream_url="http://emby.local/Videos/487/stream.ts?...#range=419108307-",
+    )
+    proc = NetworkBroadcastProcess(cfg, hls_base_dir="/tmp")
+
+    # Simulate ffprobe stdout: multiple lines, first is bin_data "N/A",
+    # second is audio packet PTS. Probe should skip N/A and pick audio.
+    def fake_run(cmd, *args, **kwargs):
+        cmd_str = " ".join(str(arg) for arg in cmd)
+        if "packet=pts_time" in cmd_str:
+            return MagicMock(
+                returncode=0,
+                # Real-world shape: bin_data packets have no PTS, audio packets do.
+                stdout="N/A\nN/A\n1.400000\n1.442000\n",
+            )
+        return MagicMock(returncode=0, stdout="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    pts = proc._probe_video_first_pts()
+
+    # Should pick the first parseable PTS (1.4) even though the first two
+    # lines were N/A (i.e. video/binary packets without PTS metadata).
+    assert pts == 1.4
+
+
+def test_probe_video_first_pts_returns_zero_when_all_lines_unparseable(monkeypatch):
+    """
+    When ffprobe finds NO usable PTS in the captured tmp file (extremely rare;
+    e.g. totally corrupted TS packet), the probe returns 0.0 so callers can
+    safely skip drift correction without crashing.
+    """
+    cfg = BroadcastConfig(
+        network_id="empty_probe",
+        stream_url="http://emby.local/Videos/0/stream.ts#range=0-",
+    )
+    proc = NetworkBroadcastProcess(cfg, hls_base_dir="/tmp")
+
+    def fake_run(cmd, *args, **kwargs):
+        cmd_str = " ".join(str(arg) for arg in cmd)
+        if "packet=pts_time" in cmd_str:
+            # All lines are N/A or empty — probe can't determine PTS.
+            return MagicMock(returncode=0, stdout="N/A\n\nN/A\n")
+        return MagicMock(returncode=0, stdout="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    pts = proc._probe_video_first_pts()
+
+    # No parseable PTS found — return 0.0, caller skips drift correction.
+    assert pts == 0.0
