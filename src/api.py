@@ -2485,11 +2485,29 @@ class BroadcastStartRequest(BaseModel):
     audio_codec: Optional[str] = None
     preset: Optional[str] = None
     hwaccel: Optional[str] = None
+    # Explicit audio stream index resolved by Laravel from the media server's own
+    # metadata for a preferred-language selection. When set, this specific stream is
+    # mapped instead of the first audio stream (index 0).
+    audio_stream_index: Optional[int] = None
+    # When set, detect embedded subtitle tracks on the source and expose the
+    # first one as a toggleable WebVTT rendition in the HLS output (master
+    # playlist + subtitle variant), rather than burning it into the video.
+    subtitles_enabled: bool = False
+    # Explicit subtitle URL resolved by Laravel from the media server's own metadata
+    # (covers embedded AND external/sidecar-file subtitles). When present, this is
+    # used directly as a second FFmpeg input instead of probing the raw video stream.
+    subtitle_url: Optional[str] = None
+    subtitle_language: Optional[str] = None
+    # Independent seek offset for subtitle_url — see BroadcastConfig.subtitle_seek_seconds.
+    subtitle_seek_seconds: Optional[int] = None
     callback_url: Optional[str] = None
     headers: Optional[Dict[str, str]] = None
     # DVR mode: preserve all HLS segments for post-processing concat
     dvr_mode: bool = False
     metadata: Optional[dict] = None
+    # Pre-queued next programme: when the current FFmpeg exits with code 0,
+    # the proxy immediately starts this config without waiting for a Laravel round-trip.
+    next_stream_config: Optional[dict] = None
 
     @field_validator("stream_url")
     @classmethod
@@ -2499,6 +2517,13 @@ class BroadcastStartRequest(BaseModel):
     @field_validator("callback_url")
     @classmethod
     def validate_callback_url(cls, v):
+        if v is not None:
+            return validate_url(v)
+        return v
+
+    @field_validator("subtitle_url")
+    @classmethod
+    def validate_subtitle_url(cls, v):
         if v is not None:
             return validate_url(v)
         return v
@@ -2552,6 +2577,47 @@ async def start_broadcast(
     to the callback_url if provided.
     """
     try:
+        # Build optional next-programme config for zero-round-trip auto-transition.
+        next_config = None
+        if request.next_stream_config:
+            nsc = request.next_stream_config
+            try:
+                next_config = BroadcastConfig(
+                    network_id=network_id,
+                    stream_url=validate_url(nsc.get("stream_url", "")),
+                    seek_seconds=int(nsc.get("seek_seconds", 0)),
+                    duration_seconds=int(nsc.get("duration_seconds", 0)),
+                    segment_start_number=0,  # overridden at transition time
+                    add_discontinuity=False,  # set to True at transition time
+                    segment_duration=int(
+                        nsc.get("segment_duration", request.segment_duration)
+                    ),
+                    hls_list_size=int(
+                        nsc.get("hls_list_size", request.hls_list_size)
+                    ),
+                    transcode=bool(nsc.get("transcode", False)),
+                    video_bitrate=nsc.get("video_bitrate"),
+                    audio_bitrate=int(nsc.get("audio_bitrate", 192)),
+                    video_resolution=nsc.get("video_resolution"),
+                    video_codec=nsc.get("video_codec"),
+                    audio_codec=nsc.get("audio_codec"),
+                    preset=nsc.get("preset"),
+                    hwaccel=nsc.get("hwaccel"),
+                    audio_stream_index=nsc.get("audio_stream_index"),
+                    subtitles_enabled=bool(nsc.get("subtitles_enabled", False)),
+                    subtitle_url=nsc.get("subtitle_url"),
+                    subtitle_language=nsc.get("subtitle_language"),
+                    subtitle_seek_seconds=nsc.get("subtitle_seek_seconds"),
+                    callback_url=nsc.get("callback_url", request.callback_url),
+                    headers=nsc.get("headers"),
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"Broadcast {network_id}: invalid next_stream_config, "
+                    f"auto-transition disabled: {exc}"
+                )
+                next_config = None
+
         config = BroadcastConfig(
             network_id=network_id,
             stream_url=request.stream_url,
@@ -2569,10 +2635,16 @@ async def start_broadcast(
             audio_codec=request.audio_codec,
             preset=request.preset,
             hwaccel=request.hwaccel,
+            audio_stream_index=request.audio_stream_index,
+            subtitles_enabled=request.subtitles_enabled,
+            subtitle_url=request.subtitle_url,
+            subtitle_language=request.subtitle_language,
+            subtitle_seek_seconds=request.subtitle_seek_seconds,
             callback_url=request.callback_url,
             headers=request.headers,
             dvr_mode=request.dvr_mode,
             metadata=request.metadata,
+            next_stream_config=next_config,
         )
         status = await broadcast_manager.start_broadcast(config)
         return BroadcastStatusResponse(
@@ -2642,22 +2714,37 @@ async def get_broadcast_playlist(network_id: str) -> Response:
 @app.get("/broadcast/{network_id}/segment/{filename}")
 async def get_broadcast_segment(network_id: str, filename: str) -> FileResponse:
     """
-    Serve a segment file for a network broadcast.
+    Serve a segment or sub-playlist file for a network broadcast.
 
-    Segments are served with caching headers since they are immutable
-    once created.
+    Segments (.ts, .vtt) are served with caching headers since they are immutable
+    once created. Sub-playlists (.m3u8) — the video/subtitle variant playlists
+    referenced from the master playlist when subtitles are active — are served
+    with no-cache headers since they're rewritten as the broadcast progresses.
     """
     segment_path = broadcast_manager.get_segment_path(network_id, filename)
     if segment_path is None or not os.path.exists(segment_path):
         raise HTTPException(status_code=404, detail="Segment not found")
-    return FileResponse(
-        segment_path,
-        media_type="video/MP2T",
-        headers={
-            "Cache-Control": "max-age=86400",  # Segments are immutable
-            "Access-Control-Allow-Origin": "*",
-        },
-    )
+
+    if filename.endswith(".vtt"):
+        media_type = "text/vtt"
+    elif filename.endswith(".m3u8"):
+        media_type = "application/vnd.apple.mpegurl"
+    else:
+        media_type = "video/MP2T"
+
+    headers = {"Access-Control-Allow-Origin": "*"}
+    if media_type == "application/vnd.apple.mpegurl":
+        headers.update(
+            {
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0",
+            }
+        )
+    else:
+        headers["Cache-Control"] = "max-age=86400"  # Segments are immutable
+
+    return FileResponse(segment_path, media_type=media_type, headers=headers)
 
 
 @app.get("/broadcast/{network_id}/status", dependencies=[Depends(verify_token)])
