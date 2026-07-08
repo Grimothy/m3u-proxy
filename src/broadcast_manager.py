@@ -9,9 +9,11 @@ Manages FFmpeg processes for network broadcasting with:
 """
 
 import asyncio
+import json
 import os
 import re
 import shutil
+import subprocess
 import time
 import logging
 from dataclasses import dataclass
@@ -46,12 +48,39 @@ class BroadcastConfig:
     audio_codec: Optional[str] = None
     preset: Optional[str] = None
     hwaccel: Optional[str] = None
+    # Explicit audio stream index resolved by Laravel from the media server's own
+    # metadata for a preferred-language selection. When set, this specific stream is
+    # mapped instead of the first audio stream (index 0).
+    audio_stream_index: Optional[int] = None
+    # When set, detect an embedded subtitle track on the source and expose it as a
+    # toggleable WebVTT rendition in the HLS output (master + subtitle variant
+    # playlist), rather than burning it into the video.
+    subtitles_enabled: bool = False
+    # Explicit subtitle URL resolved by Laravel from the media server's own metadata
+    # (covers embedded AND external/sidecar-file subtitles, which a raw ffprobe of the
+    # video file can never see). When present, this is used directly as a second FFmpeg
+    # input instead of probing the raw video stream for subtitles.
+    subtitle_url: Optional[str] = None
+    subtitle_language: Optional[str] = None
+    # Seek offset the proxy must apply to the subtitle_url input.
+    #   0    -> the subtitle URL was already seeked server-side (e.g. Emby's
+    #           startPositionTicks path segment rebased the cues to zero at the same
+    #           content-time the video was seeked to). The subtitle already shares the
+    #           video's timeline origin, so the proxy adds no -ss/-itsoffset. PREFERRED.
+    #   > 0  -> a full-file subtitle that could not be seeked server-side; the proxy seeks
+    #           it locally with -ss and corrects rebasing with -itsoffset. FALLBACK.
+    # Falls back to seek_seconds when not set, for backward compatibility.
+    subtitle_seek_seconds: Optional[int] = None
     callback_url: Optional[str] = None
     # Optional custom headers to include when FFmpeg fetches the input URL
     headers: Optional[Dict[str, str]] = None
     # DVR mode: preserve all HLS segments (no rolling deletion) for post-processing
     dvr_mode: bool = False
     metadata: Optional[Dict] = None
+    # Pre-queued next programme config for zero-round-trip auto-transition.
+    # When FFmpeg exits with code 0, the process immediately starts this config
+    # instead of waiting for a Laravel callback → start round-trip.
+    next_stream_config: Optional["BroadcastConfig"] = None
 
 
 @dataclass
@@ -116,6 +145,251 @@ class NetworkBroadcastProcess:
         self._stopping = False
         self._bytes_written: int = 0  # Cumulative bytes across all segments ever seen
         self._seen_segments: Set[str] = set()  # Segment filenames already counted
+        # Populated by _resolve_subtitle_state() before the command is built.
+        # None = no subtitle stream detected (or subtitles_enabled is False) —
+        # the command falls back to the original single-playlist output.
+        # "" or a language code = a subtitle stream is present and mapped.
+        self._subtitle_language: Optional[str] = None
+        # Which FFmpeg input the mapped subtitle stream comes from: 0 = muxed into
+        # the main video file, 1 = a separate explicit subtitle_url input.
+        self._subtitle_input_index: int = 0
+        # Cached result of the video-first-PTS probe (seconds). None = not yet probed.
+        # Used to compute subtitle drift correction after a #range= byte-seek lands
+        # mid-GOP; the probe is only paid for once per BroadcastProcess instance.
+        self._cached_video_first_pts: Optional[float] = None
+
+    async def _resolve_subtitle_state(self) -> None:
+        """
+        Determine subtitle availability for the current config, preferring an explicit
+        subtitle_url (resolved by Laravel from the media server's own metadata — covers
+        embedded AND external/sidecar-file subtitles) over probing the raw video stream.
+        Falls back to ffprobe self-detection only when no explicit URL was provided,
+        which is the only option for sources without a media-server API (Local/WebDAV).
+        """
+        if self.config.subtitle_url:
+            if await self._subtitle_url_has_content(self.config.subtitle_url):
+                self._subtitle_language = self.config.subtitle_language or ""
+                self._subtitle_input_index = 1
+                return
+
+            logger.info(
+                f"Broadcast {self.network_id}: subtitle_url returned no usable "
+                "content (likely seeked past the end of the subtitle track); "
+                "continuing without subtitles"
+            )
+            self._subtitle_language = None
+            self._subtitle_input_index = 0
+            return
+
+        self._subtitle_input_index = 0
+        if not self.config.subtitles_enabled:
+            self._subtitle_language = None
+            return
+
+        self._subtitle_language = await self._probe_subtitle_language()
+        if self._subtitle_language is None:
+            logger.info(
+                f"Broadcast {self.network_id}: subtitles_enabled but no subtitle "
+                "stream detected on source; continuing without subtitles"
+            )
+
+    async def _subtitle_url_has_content(self, url: str, min_bytes: int = 10) -> bool:
+        """
+        Verify an explicit subtitle_url actually returns usable content before handing
+        it to FFmpeg as an input. Media servers' server-side seeked subtitle endpoints
+        (e.g. Emby/Jellyfin's startPositionTicks) can return HTTP 200 with a completely
+        empty body when the seek position falls after the subtitle track's last cue —
+        e.g. resuming a mid-programme broadcast past where dialogue/subtitles end, or a
+        subtitle file that's simply shorter than the video. An empty file has no
+        parseable format, so FFmpeg aborts input probing for THE WHOLE PROCESS (video
+        and audio included), not just the subtitle stream. The optional map syntax
+        (-map 1:s:0?) does not help here — it only tolerates a missing stream inside an
+        otherwise-valid container, not an input file that fails to open at all.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(url)
+                return response.status_code == 200 and len(response.content) >= min_bytes
+        except Exception as e:
+            logger.warning(
+                f"Broadcast {self.network_id}: failed to validate subtitle_url, "
+                f"continuing without subtitles: {e}"
+            )
+            return False
+
+    # Bitmap/image-based subtitle codecs cannot be transcoded to WebVTT (a text
+    # format) — FFmpeg refuses with "Subtitle encoding currently only possible
+    # from text to text or bitmap to bitmap" and aborts the ENTIRE process
+    # (video and audio included), not just the subtitle output. Only accept
+    # text-based codecs here.
+    _TEXT_SUBTITLE_CODECS = {
+        "subrip",
+        "srt",
+        "ass",
+        "ssa",
+        "mov_text",
+        "webvtt",
+        "text",
+        "ttml",
+    }
+
+    async def _probe_subtitle_language(self) -> Optional[str]:
+        """
+        Probe the source for a text-based subtitle stream, returning its language
+        tag ("" if untagged), or None if no usable subtitle stream exists or the
+        probe fails/times out.
+
+        This MUST run before building the FFmpeg command: -var_stream_map
+        referencing a subtitle output that doesn't exist aborts the entire
+        FFmpeg process (video and audio included), not just the subtitle
+        track. Failing closed (None) on any doubt is intentional.
+        """
+        try:
+            cmd = [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "s",
+                "-show_entries",
+                "stream=index,codec_name:stream_tags=language",
+                "-of",
+                "json",
+                self.config.stream_url,
+            ]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            try:
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                logger.warning(
+                    f"Broadcast {self.network_id}: subtitle probe timed out, continuing without subtitles"
+                )
+                return None
+
+            if proc.returncode != 0:
+                return None
+
+            data = json.loads(stdout or b"{}")
+            streams = data.get("streams") or []
+            if not streams:
+                return None
+
+            # -map 0:s:0? always selects the FIRST subtitle stream in source order,
+            # so it must be the first one we inspect here too.
+            first = streams[0]
+            codec_name = (first.get("codec_name") or "").lower()
+            if codec_name not in self._TEXT_SUBTITLE_CODECS:
+                logger.info(
+                    f"Broadcast {self.network_id}: first subtitle stream is "
+                    f"'{codec_name}' (not text-based), continuing without subtitles"
+                )
+                return None
+
+            language = (first.get("tags") or {}).get("language", "") or ""
+            # Sanitize: this value is interpolated into the -var_stream_map argument,
+            # which is comma/colon-delimited. Keep it to safe identifier characters.
+            language = re.sub(r"[^a-zA-Z0-9_-]", "", language)[:10]
+            return language
+        except Exception as e:
+            logger.warning(
+                f"Broadcast {self.network_id}: subtitle probe failed, continuing without subtitles: {e}"
+            )
+            return None
+
+    def _probe_video_first_pts(self) -> float:
+        """
+        Return the first video packet's PTS (in seconds) when reading from the main
+        stream_url. Used to compute subtitle drift correction after a #range= byte-seek
+        lands mid-GOP.
+
+        After a byte-seek to offset N, ffmpeg waits for the next GOP boundary before
+        emitting the first video packet, so the first PTS is typically 1-3s (the GOP
+        size) rather than 0. The subtitle URL was server-pre-seeked to exact PTS 0 by
+        Emby's startPositionTicks, so its cues land ahead of the video without
+        correction. This probe runs once per BroadcastProcess instance; subsequent calls
+        return the cached value.
+
+        Returns 0.0 on any failure (probe timeout, ffprobe not installed, network
+        error, parse error) so the caller can skip the correction without crashing.
+        """
+        if self._cached_video_first_pts is not None:
+            return self._cached_video_first_pts
+
+        try:
+            import tempfile
+            import os
+            # ffprobe returns "N/A" for direct HTTP sources (no per-packet PTS
+            # metadata available before ffmpeg has actually read some packets),
+            # so we must first capture a tiny TS chunk to disk and probe THAT
+            # file instead. ~0.5s of stream is enough for the first GOP-boundary
+            # frame to land; the whole probe takes ~0.4s on a fast network.
+            with tempfile.NamedTemporaryFile(suffix=".ts", delete=False) as tmp:
+                tmp_path = tmp.name
+            try:
+                ffmpeg_cmd = [
+                    "ffmpeg", "-y", "-loglevel", "error",
+                    "-i", self.config.stream_url,
+                    "-t", "0.5",
+                    "-c", "copy",
+                    "-f", "mpegts",
+                    tmp_path,
+                ]
+                subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=10)
+                result = subprocess.run(
+                    [
+                        "ffprobe", "-v", "error",
+                        "-show_entries", "packet=pts_time",
+                        "-select_streams", "v",
+                        "-of", "csv=p=0",
+                        tmp_path,
+                    ],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0 and result.stdout:
+                    pts_str = result.stdout.strip().split("\n")[0].rstrip(",")
+                    if pts_str in ("N/A", "", "nan", "NaN"):
+                        logger.debug(
+                            f"Broadcast {self.network_id}: ffprobe returned no PTS "
+                            f"for first video packet ('{pts_str}'); skipping drift correction"
+                        )
+                        self._cached_video_first_pts = 0.0
+                        return 0.0
+                    pts = float(pts_str)
+                    self._cached_video_first_pts = pts
+                    logger.info(
+                        f"Broadcast {self.network_id}: video first PTS = {pts:.3f}s "
+                        f"(after #range= byte-seek; will apply -itsoffset +{pts:.3f} on subtitle input)"
+                    )
+                    return pts
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                f"Broadcast {self.network_id}: video PTS probe timed out after 10s; "
+                f"skipping subtitle drift correction"
+            )
+        except FileNotFoundError:
+            logger.warning(
+                f"Broadcast {self.network_id}: ffprobe not found; "
+                f"skipping subtitle drift correction"
+            )
+        except Exception as e:
+            logger.warning(
+                f"Broadcast {self.network_id}: video PTS probe failed: {e}; "
+                f"skipping subtitle drift correction"
+            )
+
+        self._cached_video_first_pts = 0.0
+        return 0.0
 
     def _build_ffmpeg_command(self) -> List[str]:
         """Build the FFmpeg command for HLS broadcast output."""
@@ -183,14 +457,114 @@ class NetworkBroadcastProcess:
         if "-i" not in cmd:
             cmd.extend(["-i", self.config.stream_url])
 
+        # Subtitles are active either because an explicit subtitle_url was resolved by
+        # Laravel (input index 1 — a separate file, e.g. an external/sidecar subtitle) or
+        # because _probe_subtitle_language() found one muxed into the main video (input
+        # index 0). Requesting a subtitle output that doesn't exist aborts the whole
+        # process below via -var_stream_map, so this must never be assumed — only
+        # resolved/probed ahead of time by _resolve_subtitle_state().
+        subtitles_active = self._subtitle_language is not None
+
+        # A separate subtitle input MUST be added here — before -t below — so that
+        # ffmpeg's per-input option scoping doesn't misattribute -t to this input
+        # instead of applying it as the intended output-level duration limit.
+        if subtitles_active and self._subtitle_input_index == 1:
+            # Seek to match the main input's effective playback position so subtitle cue
+            # timestamps stay in sync with a resumed/seeked broadcast instead of restarting
+            # from the subtitle file's own time zero.
+            #
+            # PREFERRED PATH (subtitle_seek_seconds == 0): Laravel now asks the media server
+            # to seek the subtitle URL server-side (e.g. Emby's startPositionTicks path
+            # segment), which rebases the cues to zero at the same content-time the video was
+            # seeked to. The subtitle then already shares the video's timeline origin, so we
+            # add NO -ss / -itsoffset here — a single seek authority (the media server) drives
+            # both streams, which is what keeps them frame-locked. This is the branch that
+            # runs for Emby/Jellyfin broadcasts.
+            #
+            # EXPLICIT PATH (subtitle_seek_seconds > 0): a full-file subtitle that could not
+            # be seeked server-side. We seek it locally with -ss and correct the rebasing with
+            # -itsoffset (see below). PHP always sends this explicitly after the Jul 6
+            # single-authority fix; it relies on demuxer-specific rebasing behavior and is
+            # inherently more fragile than the server-side path.
+            #
+            # FALLBACK (subtitle_seek_seconds is None): older clients may not send
+            # subtitle_seek_seconds. Fall back to 0 (no seek) — NEVER to seek_seconds,
+            # which is the VIDEO input's seek and would push subtitle cue timestamps out
+            # of sync with the video.
+            subtitle_seek = self.config.subtitle_seek_seconds or 0
+            if subtitle_seek > 0:
+                cmd.extend(["-ss", str(subtitle_seek)])
+                # -ss skips the subtitle file's early cues but does NOT rebase the
+                # timestamps of the ones that survive — they stay absolute (relative to
+                # the subtitle file's own time zero). Emby/Jellyfin's VideoCodec=copy
+                # remux, however, DOES rebase the video's own PTS to ~0 at the seek
+                # point (confirmed via ffprobe on a live source: first video packet PTS
+                # ≈ 0, not ≈ the seek offset). Without correcting for that mismatch,
+                # every surviving subtitle cue is subtitle_seek seconds too late
+                # relative to the video it's supposed to caption. -itsoffset shifts this
+                # input's output timestamps by the same (negative) amount to re-align it
+                # with the video's rebased timeline.
+                cmd.extend(["-itsoffset", str(-subtitle_seek)])
+            # Without reconnect options, Emby/Jellyfin closing this connection mid-broadcast
+            # (observed via a lingering CLOSE-WAIT socket on a multi-hour live run) leaves
+            # ffmpeg with a dead subtitle input it never retries. Because the subtitle map
+            # below is optional (`?`), ffmpeg doesn't error out — it just silently stops
+            # emitting any further subtitle cues for the rest of the broadcast, which looks
+            # like subtitles "going out of sync" or disappearing rather than a crash.
+            cmd.extend(
+                [
+                    "-reconnect",
+                    "1",
+                    "-reconnect_streamed",
+                    "1",
+                    "-reconnect_delay_max",
+                    "10",
+                ]
+            )
+
+            # Drift correction: after a #range= byte-seek on the video input, ffmpeg waits
+            # for the next GOP boundary before emitting the first packet, so the video's
+            # first PTS is offset by the GOP size (~1-3s typically). The subtitle input
+            # was server-pre-seeked by Emby to exact PTS 0, so its cues land ahead of the
+            # video. Shift the subtitle's output timestamps forward by the video's first
+            # PTS so cues land aligned with the video's GOP start.
+            # Only probe when seek_seconds > 0 (the byte-seek path); when seek_seconds=0
+            # the video starts at PTS 0 so there is no drift to correct.
+            if self.config.seek_seconds > 0:
+                video_drift = self._probe_video_first_pts()
+                if video_drift > 0.1:  # only apply when drift is meaningful (>100ms)
+                    cmd.extend(["-itsoffset", str(video_drift)])
+
+            cmd.extend(["-i", self.config.subtitle_url])
+
         # Duration limiting for programme boundary
         if self.config.duration_seconds > 0:
             cmd.extend(["-t", str(self.config.duration_seconds)])
 
-        # Stream mapping - video + audio only (drop subtitles, data streams)
-        # Both video and audio are optional to support audio-only streams (e.g. radio stations)
-        # and video-only streams. FFmpeg silently skips missing optional streams.
-        cmd.extend(["-map", "0:v:0?", "-map", "0:a:0?"])
+        # Stream mapping - video + audio (+ subtitle, if detected). Video and audio are
+        # optional to support audio-only streams (e.g. radio stations) and video-only
+        # streams. FFmpeg silently skips missing optional streams. An explicit
+        # audio_stream_index (resolved by Laravel for a preferred-language selection)
+        # maps that specific stream instead of the default first audio stream.
+        #
+        # Laravel resolves audio_stream_index from the media server's own MediaStreams
+        # metadata, which is an ABSOLUTE index spanning video+audio+subtitle streams
+        # together (e.g. video=0, audio=1, subtitles=2..N). FFmpeg's "a:N" specifier is
+        # type-RELATIVE (the Nth audio stream) — those only coincide when audio happens
+        # to be the very first stream in the file, which is virtually never true. Using
+        # "a:N" here silently maps nothing whenever N doesn't match an actual audio-type
+        # position (the "?" swallows the miss), which then makes "-var_stream_map"'s
+        # "a:0" reference dangling and aborts the WHOLE HLS conversion — not just audio.
+        # The absolute-index form ("0:N", no type letter) selects by the same numbering
+        # Laravel resolved against, so it always lands on the right stream.
+        audio_map = (
+            f"0:{self.config.audio_stream_index}?"
+            if self.config.audio_stream_index is not None
+            else "0:a:0?"
+        )
+        cmd.extend(["-map", "0:v:0?", "-map", audio_map])
+        if subtitles_active:
+            cmd.extend(["-map", f"{self._subtitle_input_index}:s:0?"])
 
         # Codec selection
         if self.config.transcode:
@@ -220,6 +594,19 @@ class NetworkBroadcastProcess:
         else:
             cmd.extend(["-c:v", "copy", "-c:a", "copy"])
 
+        if subtitles_active:
+            cmd.extend(["-c:s", "webvtt"])
+            # HLS's #EXT-X-STREAM-INF requires a BANDWIDTH value, which FFmpeg only
+            # emits when it has an explicit bitrate for the stream. In copy mode
+            # (and whenever video_bitrate/audio_bitrate weren't already added above)
+            # there's no encoder bitrate to read, so add a hint purely for the
+            # manifest — it does not affect actual stream quality since -c:v/-c:a
+            # copy ignores -b:v/-b:a for encoding.
+            if "-b:v" not in cmd:
+                cmd.extend(["-b:v", f"{self.config.video_bitrate or 2000}k"])
+            if "-b:a" not in cmd:
+                cmd.extend(["-b:a", f"{self.config.audio_bitrate}k"])
+
         # HLS output configuration
         cmd.extend(["-f", "hls"])
         cmd.extend(["-hls_time", str(self.config.segment_duration)])
@@ -241,13 +628,30 @@ class NetworkBroadcastProcess:
             hls_flags.append("discont_start")
         cmd.extend(["-hls_flags", "+".join(hls_flags)])
 
-        # Segment filename template (6-digit zero-padded)
-        segment_pattern = os.path.join(self.hls_dir, "live%06d.ts")
-        cmd.extend(["-hls_segment_filename", segment_pattern])
+        if subtitles_active:
+            # A subtitle rendition forces FFmpeg's variant-stream mode: instead of one
+            # flat live.m3u8, it emits a master playlist referencing a video variant
+            # playlist and a subtitle variant playlist (numeric %v, no `name:` — that
+            # would substitute a string into filenames and complicate serving them).
+            var_stream_map = "v:0,a:0,s:0,sgroup:subs"
+            if self._subtitle_language:
+                var_stream_map += f",language:{self._subtitle_language}"
+            cmd.extend(["-var_stream_map", var_stream_map])
+            cmd.extend(["-master_pl_name", "master.m3u8"])
 
-        # Output playlist
-        playlist_path = os.path.join(self.hls_dir, "live.m3u8")
-        cmd.append(playlist_path)
+            segment_pattern = os.path.join(self.hls_dir, "live%v_%06d.ts")
+            cmd.extend(["-hls_segment_filename", segment_pattern])
+
+            playlist_path = os.path.join(self.hls_dir, "live_%v.m3u8")
+            cmd.append(playlist_path)
+        else:
+            # Segment filename template (6-digit zero-padded)
+            segment_pattern = os.path.join(self.hls_dir, "live%06d.ts")
+            cmd.extend(["-hls_segment_filename", segment_pattern])
+
+            # Output playlist
+            playlist_path = os.path.join(self.hls_dir, "live.m3u8")
+            cmd.append(playlist_path)
 
         return cmd
 
@@ -273,7 +677,7 @@ class NetworkBroadcastProcess:
                     if os.path.isdir(self.hls_dir)
                     else []
                 ):
-                    if filename.endswith((".ts", ".m3u8")):
+                    if filename.endswith((".ts", ".m3u8", ".vtt")):
                         try:
                             os.remove(os.path.join(self.hls_dir, filename))
                             stale_count += 1
@@ -287,6 +691,8 @@ class NetworkBroadcastProcess:
                     logger.info(
                         f"Broadcast {self.network_id}: removed {stale_count} stale file(s) before fresh start"
                     )
+
+            await self._resolve_subtitle_state()
 
             cmd = self._build_ffmpeg_command()
             logger.info(f"Starting broadcast {self.network_id}: {' '.join(cmd)}")
@@ -450,49 +856,160 @@ class NetworkBroadcastProcess:
             return
 
         try:
-            await self.process.wait()
+            while True:
+                await self.process.wait()
 
-            # Skip callback on intentional stop — the editor initiated it and handles
-            # post-processing directly without waiting for a proxy callback.
-            if self._stopping:
-                return
+                # Skip callback on intentional stop — the editor initiated it and handles
+                # post-processing directly without waiting for a proxy callback.
+                if self._stopping:
+                    return
 
-            # Determine final segment number
-            final_segment = self._get_final_segment_number()
-            self.current_segment_number = final_segment
+                # Determine final segment number
+                final_segment = self._get_final_segment_number()
+                self.current_segment_number = final_segment
 
-            # Calculate duration streamed
-            duration_streamed = 0.0
-            if self.started_at:
-                duration_streamed = (
-                    datetime.now(timezone.utc) - self.started_at
-                ).total_seconds()
+                # Calculate duration streamed
+                duration_streamed = 0.0
+                if self.started_at:
+                    duration_streamed = (
+                        datetime.now(timezone.utc) - self.started_at
+                    ).total_seconds()
 
-            exit_code = self.process.returncode
-            if exit_code == 0:
-                # Normal completion (duration limit reached) or intentional DVR stop
-                self.status = "stopped"
-                await self._send_callback(
-                    "programme_ended",
-                    {
-                        "exit_code": exit_code,
-                        "final_segment_number": final_segment,
-                        "duration_streamed": duration_streamed,
-                    },
-                )
-            else:
-                # Abnormal exit
-                self.status = "failed"
-                self.error_message = f"FFmpeg exited with code {exit_code}"
-                await self._send_callback(
-                    "broadcast_failed",
-                    {
-                        "exit_code": exit_code,
-                        "final_segment_number": final_segment,
-                        "duration_streamed": duration_streamed,
-                        "error": self.error_message,
-                    },
-                )
+                exit_code = self.process.returncode
+
+                if exit_code == 0 and self.config.next_stream_config:
+                    # Auto-transition: immediately start the next programme without
+                    # waiting for the Laravel callback → start round-trip.
+                    next_config = self.config.next_stream_config
+                    next_config.network_id = self.network_id
+                    next_config.segment_start_number = final_segment + 1
+                    next_config.add_discontinuity = True
+
+                    # Cancel old stderr/poll tasks before swapping the subprocess.
+                    for task in [self._stderr_task, self._poll_task]:
+                        if task and not task.done():
+                            task.cancel()
+                            try:
+                                await task
+                            except asyncio.CancelledError:
+                                pass
+
+                    # Reset per-segment tracking for the new programme.
+                    self._bytes_written = 0
+                    self._seen_segments = set()
+                    self.error_message = None
+                    self.config = next_config
+
+                    # Re-resolve for the new programme's content — the previous
+                    # programme's subtitle availability/language/URL does not carry over.
+                    previous_subtitles_active = self._subtitle_language is not None
+                    await self._resolve_subtitle_state()
+                    new_subtitles_active = self._subtitle_language is not None
+
+                    if previous_subtitles_active != new_subtitles_active:
+                        # The manifest shape is changing (subtitled <-> non-subtitled).
+                        # Remove the outgoing mode's manifest file(s) so
+                        # get_playlist_path()/cleanup_orphaned_segments() never mistake
+                        # a stale leftover for the current invocation's output. Segment
+                        # files (.ts/.vtt) are left alone — only manifests are mode-specific.
+                        stale_files = (
+                            ["live.m3u8"]
+                            if new_subtitles_active
+                            else ["master.m3u8", "live_0.m3u8", "live_0_vtt.m3u8"]
+                        )
+                        for stale_name in stale_files:
+                            try:
+                                os.remove(os.path.join(self.hls_dir, stale_name))
+                            except FileNotFoundError:
+                                pass
+                            except OSError as e:
+                                logger.warning(
+                                    f"Broadcast {self.network_id}: could not remove stale manifest {stale_name}: {e}"
+                                )
+
+                    logger.info(
+                        f"Broadcast {self.network_id}: auto-transitioning from "
+                        f"segment {final_segment} to next programme"
+                    )
+
+                    cmd = self._build_ffmpeg_command()
+                    logger.info(
+                        f"Broadcast {self.network_id}: starting next programme: "
+                        + " ".join(cmd[:6])
+                        + " ..."
+                    )
+
+                    try:
+                        self.process = await asyncio.create_subprocess_exec(
+                            *cmd,
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.PIPE,
+                        )
+                        self.started_at = datetime.now(timezone.utc)
+                        self.status = "running"
+                        new_pid = self.process.pid
+                        logger.info(
+                            f"Broadcast {self.network_id}: auto-transitioned, "
+                            f"PID {new_pid}, segment start "
+                            f"{next_config.segment_start_number}"
+                        )
+                    except Exception as exc:
+                        logger.error(
+                            f"Broadcast {self.network_id}: auto-transition "
+                            f"failed to start FFmpeg: {exc}"
+                        )
+                        self.status = "failed"
+                        self.error_message = str(exc)
+                        new_pid = None
+
+                    # Notify Laravel asynchronously — don't block the new process.
+                    asyncio.create_task(
+                        self._send_callback(
+                            "programme_ended",
+                            {
+                                "exit_code": exit_code,
+                                "final_segment_number": final_segment,
+                                "duration_streamed": duration_streamed,
+                                "auto_transitioned": True,
+                                "new_pid": new_pid,
+                            },
+                        )
+                    )
+
+                    if new_pid:
+                        # Restart per-process monitoring tasks and loop to watch new process.
+                        self._stderr_task = asyncio.create_task(self._log_stderr())
+                        self._poll_task = asyncio.create_task(self._poll_bytes())
+                        continue
+                    else:
+                        return
+
+                elif exit_code == 0:
+                    # Normal completion (duration limit reached) or intentional DVR stop.
+                    self.status = "stopped"
+                    await self._send_callback(
+                        "programme_ended",
+                        {
+                            "exit_code": exit_code,
+                            "final_segment_number": final_segment,
+                            "duration_streamed": duration_streamed,
+                        },
+                    )
+                    break
+                else:
+                    # Abnormal exit
+                    self.status = "failed"
+                    self.error_message = f"FFmpeg exited with code {exit_code}"
+                    await self._send_callback(
+                        "broadcast_failed",
+                        {
+                            "exit_code": exit_code,
+                            "final_segment_number": final_segment,
+                            "duration_streamed": duration_streamed,
+                            "error": self.error_message,
+                        },
+                    )
+                    break
 
         except asyncio.CancelledError:
             pass
@@ -585,8 +1102,10 @@ class NetworkBroadcastProcess:
             if not os.path.exists(self.hls_dir):
                 return self.config.segment_start_number
 
-            # Pattern: live000001.ts -> extract 000001
-            pattern = re.compile(r"live(\d{6})\.ts$")
+            # Pattern: live000001.ts -> extract 000001. When subtitles are active,
+            # segments are named live{variant}_000001.ts (e.g. live0_000001.ts) —
+            # the optional `\d+_` group tolerates that variant-index prefix.
+            pattern = re.compile(r"live(?:\d+_)?(\d{6})\.ts$")
             max_segment = self.config.segment_start_number
 
             for filename in os.listdir(self.hls_dir):
@@ -627,17 +1146,33 @@ class NetworkBroadcastProcess:
         Returns:
             Number of files removed.
         """
-        playlist_path = os.path.join(self.hls_dir, "live.m3u8")
-        if not os.path.exists(playlist_path):
-            return 0
+        # Whether subtitles are active for the CURRENT ffmpeg invocation. This must be
+        # keyed off self._subtitle_language, not "does master.m3u8 exist on disk" — a
+        # transition from subtitled to non-subtitled content (or vice versa) leaves the
+        # previous invocation's manifest file(s) on disk (stale-file cleanup is skipped
+        # during transitions to preserve segment continuity), which would otherwise make
+        # this permanently misidentify the current mode after a mode-changing transition.
+        subtitles_active = self._subtitle_language is not None
+        if subtitles_active:
+            # Referenced segments (both .ts and .vtt) are split across the video and
+            # subtitle variant playlists rather than one flat live.m3u8.
+            referenced = self.parse_playlist_segments(
+                os.path.join(self.hls_dir, "live_0.m3u8")
+            ) | self.parse_playlist_segments(
+                os.path.join(self.hls_dir, "live_0_vtt.m3u8")
+            )
+        else:
+            playlist_path = os.path.join(self.hls_dir, "live.m3u8")
+            if not os.path.exists(playlist_path):
+                return 0
+            referenced = self.parse_playlist_segments(playlist_path)
 
-        referenced = self.parse_playlist_segments(playlist_path)
         removed = 0
         now = time.time()
 
         try:
             for filename in os.listdir(self.hls_dir):
-                if not filename.endswith(".ts"):
+                if not filename.endswith((".ts", ".vtt")):
                     continue
                 if filename in referenced:
                     continue
@@ -686,15 +1221,26 @@ class NetworkBroadcastProcess:
         )
 
     def get_playlist_path(self) -> Optional[str]:
-        """Get path to the HLS playlist file."""
-        path = os.path.join(self.hls_dir, "live.m3u8")
+        """
+        Get path to the HLS playlist file for the CURRENT ffmpeg invocation.
+
+        When subtitles are active FFmpeg writes a master.m3u8 (referencing a video
+        variant + subtitle variant playlist) instead of a flat live.m3u8. This is
+        keyed off self._subtitle_language rather than "does master.m3u8 exist on
+        disk" — a transition from subtitled to non-subtitled content (or vice versa)
+        leaves the previous invocation's manifest file on disk (stale-file cleanup
+        is skipped during transitions to preserve segment continuity), which would
+        otherwise keep serving a stale master/flat playlist after the mode changes.
+        """
+        filename = "master.m3u8" if self._subtitle_language is not None else "live.m3u8"
+        path = os.path.join(self.hls_dir, filename)
         return path if os.path.exists(path) else None
 
     def get_segment_path(self, filename: str) -> Optional[str]:
-        """Get path to a specific segment file."""
+        """Get path to a specific segment or sub-playlist file."""
         # Sanitize filename to prevent directory traversal
         safe_filename = os.path.basename(filename)
-        if not safe_filename.endswith(".ts"):
+        if not safe_filename.endswith((".ts", ".vtt", ".m3u8")):
             return None
 
         path = os.path.join(self.hls_dir, safe_filename)
@@ -922,10 +1468,12 @@ class BroadcastManager:
     async def read_playlist(self, network_id: str) -> Optional[str]:
         """Read the HLS playlist content for a network."""
         if network_id not in self.broadcasts:
-            # Check if directory exists even without active broadcast (for recovery)
-            playlist_path = os.path.join(
-                self.hls_base_dir, f"broadcast_{network_id}", "live.m3u8"
-            )
+            # Check if directory exists even without active broadcast (for recovery).
+            # Prefer master.m3u8 (subtitles active) over the flat live.m3u8.
+            broadcast_dir = os.path.join(self.hls_base_dir, f"broadcast_{network_id}")
+            playlist_path = os.path.join(broadcast_dir, "master.m3u8")
+            if not os.path.exists(playlist_path):
+                playlist_path = os.path.join(broadcast_dir, "live.m3u8")
             if os.path.exists(playlist_path):
                 try:
                     with open(playlist_path, "r") as f:
@@ -948,10 +1496,10 @@ class BroadcastManager:
             return None
 
     def get_segment_path(self, network_id: str, filename: str) -> Optional[str]:
-        """Get path to a segment file for a network."""
+        """Get path to a segment or sub-playlist file for a network."""
         # Sanitize filename
         safe_filename = os.path.basename(filename)
-        if not safe_filename.endswith(".ts"):
+        if not safe_filename.endswith((".ts", ".vtt", ".m3u8")):
             return None
 
         # Check active broadcast first
