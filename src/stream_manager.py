@@ -460,7 +460,6 @@ class StreamManager:
             or "/timeshift/" in url_lower
             or "/movie/" in url_lower
             or "/series/" in url_lower
-            or "/dvr/recordings/" in url_lower
         ):
             return (False, True, False)
 
